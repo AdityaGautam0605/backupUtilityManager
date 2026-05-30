@@ -19,7 +19,7 @@ public class MongoService implements DatabaseService {
             // running a lightweight admin ping command to verify the active network link
             Document ping = mongoClient.getDatabase("admin").runCommand(new Document("ping", 1));
             if (ping.containsKey("ok") && ((Number) ping.get("ok")).doubleValue() == 1){
-                System.out.println("Handshake successful! MongoDB cluster authenticaton is valid");
+                System.out.println("Handshake successful! MongoDB cluster authentication is valid");
                 return true;
             }
         }catch (Exception e){
@@ -43,8 +43,8 @@ public class MongoService implements DatabaseService {
         String finalFileName = String.format("%s_%s_backup.bson.gz", config.getDbName(), timestamp);
         java.nio.file.Path outputPath = java.nio.file.Paths.get(outputDir, finalFileName);
 
-        System.out.println("📦 Initiating MongoDB streaming compression engine...");
-        System.out.println("💾 Target destination path: " + outputPath.toAbsolutePath());
+        System.out.println("Initiating MongoDB streaming compression engine...");
+        System.out.println("Target destination path: " + outputPath.toAbsolutePath());
 
         // Build the native arguments to call mongodump
         // CRITICAL: --archive with no file path forces output directly to standard stdout stream!
@@ -75,16 +75,16 @@ public class MongoService implements DatabaseService {
             int exitCode = process.waitFor();
 
             if (exitCode == 0) {
-                System.out.println("🎉 MongoDB backup pipeline completed successfully!");
-                System.out.println("📐 Compressed archive sealed at: " + outputPath.toFile().length() + " bytes.");
+                System.out.println("MongoDB backup pipeline completed successfully!");
+                System.out.println("Compressed archive sealed at: " + outputPath.toFile().length() + " bytes.");
             } else {
                 java.io.InputStream errorStream = process.getErrorStream();
                 String errorMsg = new String(errorStream.readAllBytes());
-                System.err.println("❌ Native mongodump engine extraction failed with exit code (" + exitCode + "): " + errorMsg);
+                System.err.println("Native mongodump engine extraction failed with exit code (" + exitCode + "): " + errorMsg);
             }
 
         } catch (Exception e) {
-            System.err.println("❌ MongoDB Core Engine Stream Failure: " + e.getMessage());
+            System.err.println("MongoDB Core Engine Stream Failure: " + e.getMessage());
         }
     }
 
