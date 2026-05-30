@@ -2,6 +2,7 @@ package com.backuputil.cli;
 
 import com.backuputil.config.DbConfig;
 import com.backuputil.service.impl.DatabaseService;
+import com.backuputil.service.impl.MongoService;
 import com.backuputil.service.impl.MysqlService;
 import com.backuputil.service.impl.PostgresService;
 import picocli.CommandLine.Command;
@@ -34,11 +35,14 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"-d", "--database"}, description = "Target database name", required = true)
     private String dbName;
 
+    @Option(names = {"-Mock", "--mock"}, description = "Mock Variable for testing", required = true)
+    private boolean mock;
+
     @Override
     public Integer call() throws Exception {
         System.out.println ("Initializing workflow verification...");
 
-        DbConfig config = new DbConfig (host, port, user, password, dbName);
+        DbConfig config = new DbConfig (host, port, user, password, dbName, mock);
 
         DatabaseService dbService;
 
@@ -46,6 +50,8 @@ public class BackupCommand implements Callable<Integer> {
             dbService = new PostgresService();
         }else if ("mysql".equalsIgnoreCase(dbType)){
             dbService = new MysqlService();
+        }else if ("mongo".equalsIgnoreCase(dbType)){
+            dbService = new MongoService();
         }
         else{
             System.out.println ("Error: Unsupported Database management system engine: "+ dbType);
