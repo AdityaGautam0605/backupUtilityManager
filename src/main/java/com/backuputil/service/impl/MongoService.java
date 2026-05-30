@@ -68,7 +68,7 @@ public class MongoService implements DatabaseService {
                  java.io.FileOutputStream fileOutputStream = new java.io.FileOutputStream(outputPath.toFile());
                  java.util.zip.GZIPOutputStream gzipOutputStream = new java.util.zip.GZIPOutputStream(fileOutputStream)) {
 
-                System.out.println("⚡ Pumping and compressing MongoDB binary streams concurrently...");
+                System.out.println("Pumping and compressing MongoDB binary streams concurrently...");
                 processStdout.transferTo(gzipOutputStream);
             }
 
