@@ -1,12 +1,13 @@
 package com.backuputil.cli;
 
 import com.backuputil.config.DbConfig;
-import com.backuputil.service.impl.DatabaseService;
+import com.backuputil.service.DatabaseService;
 import com.backuputil.service.impl.MongoService;
 import com.backuputil.service.impl.MysqlService;
 import com.backuputil.service.impl.PostgresService;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
+import com.backuputil.model.BackupResult;
 
 import java.util.concurrent.Callable;
 
@@ -35,7 +36,7 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"-d", "--database"}, description = "Target database name", required = true)
     private String dbName;
 
-    @Option(names = {"-Mock", "--mock"}, description = "Mock Variable for testing", required = true)
+    @Option(names = {"--mock"}, description = "Mock Variable for testing", defaultValue = "false")
     private boolean mock;
 
     @Override
@@ -68,17 +69,23 @@ public class BackupCommand implements Callable<Integer> {
                 directory.mkdirs();
             }
 
-            try {
-                dbService.backup(config, outputDir);
-                return 0;
-            } catch (IllegalArgumentException e) {
-                System.err.println(e.getMessage());
-                System.err.println("Workflow aborted safely due to configuration constraints. ");
-                return 1;
-            } catch (Exception e){
-                System.err.println ("Unexpected runtime pipeline error: "+ e.getMessage());
-                return 1;
-            }
+           try{
+               BackupResult result = dbService.backup(config, outputDir);
+               if (result.getStatus() == BackupResult.Status.SUCCESS){
+                   System.out.println("Backup completed: "+ result);
+                   return 0;
+               }else{
+                   System.err.println("Backup failed: " + result);
+                   return 1;
+               }
+           }catch (IllegalArgumentException e){
+               System.err.println(e.getMessage());
+               System.err.println("Workflow aborted safely due to configuration constraints.");
+               return 1;
+           } catch (Exception e){
+               System.err.println ("Unexpected runtime pipeline error: " + e.getMessage());
+               return 1;
+           }
         }else{
             System.out.println("Workflow terminated early due to verification failure.");
             return 1;

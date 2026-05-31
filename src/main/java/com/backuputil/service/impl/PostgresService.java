@@ -1,12 +1,14 @@
 package com.backuputil.service.impl;
 
 import com.backuputil.config.DbConfig;
+import com.backuputil.model.BackupResult;
+import com.backuputil.service.DatabaseService;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 
-public class PostgresService implements DatabaseService{
+public class PostgresService implements DatabaseService {
     @Override
     public boolean testConnection (DbConfig config){
         String url = String.format("jdbc:postgresql://%s:%d/%s",
@@ -22,13 +24,16 @@ public class PostgresService implements DatabaseService{
         }catch (SQLException e){
             System.out.println("Database Handshake Failed: "+ e.getMessage());
         }
-        // Temporary Testing bypass
-        System.out.println ("Warning: Bypassing failure gate for Week 2 stream engine");
-        return true;
+
+        if (config.isMock()){
+            System.out.println("Warning: bypassing failure gate via active --mock flag...");
+            return true;
+        }
+        return false;
     }
 
     @Override
-    public void backup(DbConfig config, String outputDir){
+    public BackupResult backup(DbConfig config, String outputDir) throws Exception{
         // Defensive Validation Check
         if (config == null){
             throw new IllegalArgumentException("Backup Core Error: Database Configuration profile cannot be null. ");
@@ -59,15 +64,36 @@ public class PostgresService implements DatabaseService{
         };
 
         ProcessBuilder pb = new ProcessBuilder(command);
+        pb.environment().put("PGPASSWORD", config.getPassword());
 
-        // Inject the database password into the environment variables of the process
-        // pg_dump securely looks for thd PGPASSWORD variable to bypass interactive terminal inputs;
+        // track start time
+        long startTime = System.currentTimeMillis();
 
-        java.util.Map<String , String> env = pb.environment();
-        env.put("PGPASSWORD", config.getPassword());
+        // Explanation to the below code:
+        // Why?
+        // When executing an external process, the OS allocates a small, fixed size buffer for the process's standard err
+        // (stderr) and standard output (stdout) streams. If the external process generates a lot of error output and fills this
+        // buffer, it will block and hang indefinitely waiting for the buffer to be cleared.
+        //
+        // How it works?
+        // By reading the error stream asynchronously on a background Virtual Thread, we continuously drain the OS buffer as fast as it fills.
+        // This ensures the external process never stalls, while allowing our main thread to continue executing or safely wait for the process
+        // to exit via proces.waitFor().
 
         try{
             Process process = pb.start();
+
+            // capturing the stderr output reference (array trick for lambda capture)
+            String[] stderrOutput = {""};
+
+            // Drain stderr on a background thread to prevent deadlock
+            Thread stderrDrainer = Thread.ofVirtual().start(()->{
+                try{
+                    stderrOutput[0] = new String(process.getErrorStream().readAllBytes());
+                }catch (Exception ignored){}
+                // Explicitly ignoring exceptions here as process termination or stream closure
+                // can throw expected IOExceptions during cleanup.
+            });
 
             try (java.io.InputStream processStdout = process.getInputStream();
                 java.io.FileOutputStream fileOutputStream = new java.io.FileOutputStream(outputPath.toFile());
@@ -79,21 +105,43 @@ public class PostgresService implements DatabaseService{
                 processStdout.transferTo(gzipOutputStream);
             }
 
+
             // Wait for the background operating system task to officially finish
             int exitCode = process.waitFor();
+            stderrDrainer.join();// wait for stderr thread to finish
+            long durationMs = System.currentTimeMillis() - startTime;
 
             if (exitCode == 0){
                 System.out.println("Backup pipeline completed successfully ! ");
-                System.out.println("Compressed archive sealed at: "+ outputPath.toFile().length() + "bytes.");
+                return new BackupResult(
+                        BackupResult.Status.SUCCESS,
+                        config.getDbName(), "postgres",
+                        outputPath.toAbsolutePath().toString(),
+                        outputPath.toFile().length(),
+                        durationMs, exitCode, null,
+                        java.time.Instant.now()
+                );
             }else {
                 // Read any error text thrown by pg_dump itself.
-                java.io.InputStream errorStream = process.getErrorStream();
-                String errorMsg = new String(errorStream.readAllBytes());
-                System.err.println("Native pg_dump engine extraction failed with exit code ("+ exitCode +"): "+errorMsg);
-
+                System.err.println("Native pg_dump failed with exit code (" + exitCode + "): " + stderrOutput[0]);
+                return new BackupResult(
+                        BackupResult.Status.FAILED,
+                        config.getDbName(), "postgres",
+                        outputPath.toAbsolutePath().toString(),
+                        0, durationMs, exitCode, stderrOutput[0],
+                        java.time.Instant.now()
+                );
             }
         } catch (Exception e){
-            System.err.println ("Core Engine Stream Failure: "+ e.getMessage());
+            long durationMs = System.currentTimeMillis() - startTime;
+            System.err.println("Core Engine Stream Failure: " + e.getMessage());
+            return new BackupResult(
+                    BackupResult.Status.FAILED,
+                    config.getDbName(), "postgres",
+                    outputPath.toAbsolutePath().toString(),
+                    0, durationMs, -1, e.getMessage(),
+                    java.time.Instant.now()
+            );
         }
 
     }

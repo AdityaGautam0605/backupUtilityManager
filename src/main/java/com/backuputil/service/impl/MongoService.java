@@ -1,7 +1,8 @@
 package com.backuputil.service.impl;
 
 import com.backuputil.config.DbConfig;
-import com.backuputil.service.impl.DatabaseService;
+import com.backuputil.service.DatabaseService;
+import com.backuputil.model.BackupResult;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
@@ -34,8 +35,8 @@ public class MongoService implements DatabaseService {
     }
 
     @Override
-    public void backup (DbConfig config, String outputDir){
-        if (config == null){
+    public BackupResult backup (DbConfig config, String outputDir) {
+        if (config == null) {
             throw new IllegalArgumentException("Backup Core Error: Database Configuration profile cannot be null");
         }
         String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
@@ -59,9 +60,32 @@ public class MongoService implements DatabaseService {
         };
 
         ProcessBuilder pb = new ProcessBuilder(command);
+        long startTime = System.currentTimeMillis();
+
+        // Explanation to the below code:
+        // Why?
+        // When executing an external process, the OS allocates a small, fixed size buffer for the process's standard err
+        // (stderr) and standard output (stdout) streams. If the external process generates a lot of error output and fills this
+        // buffer, it will block and hang indefinitely waiting for the buffer to be cleared.
+        //
+        // How it works?
+        // By reading the error stream asynchronously on a background Virtual Thread, we continuously drain the OS buffer as fast as it fills.
+        // This ensures the external process never stalls, while allowing our main thread to continue executing or safely wait for the process
+        // to exit via proces.waitFor().
 
         try {
             Process process = pb.start();
+
+            String[] stderrOutput = {""};
+
+            Thread stderrDrainer = Thread.ofVirtual().start(() -> {
+                try {
+                    stderrOutput[0] = new String(process.getErrorStream().readAllBytes());
+                } catch (Exception ignored) {
+                }
+                // Explicitly ignoring exceptions here as process termination or stream closure
+                // can throw expected IOExceptions during cleanup.
+            });
 
             // Stream and compress the binary BSON bytes into our local archive file
             try (java.io.InputStream processStdout = process.getInputStream();
@@ -73,18 +97,39 @@ public class MongoService implements DatabaseService {
             }
 
             int exitCode = process.waitFor();
+            stderrDrainer.join();
+            long durationMs = System.currentTimeMillis() - startTime;
 
             if (exitCode == 0) {
                 System.out.println("MongoDB backup pipeline completed successfully!");
-                System.out.println("Compressed archive sealed at: " + outputPath.toFile().length() + " bytes.");
+                return new BackupResult(
+                        BackupResult.Status.SUCCESS,
+                        config.getDbName(), "mysql",
+                        outputPath.toAbsolutePath().toString(),
+                        outputPath.toFile().length(),
+                        durationMs, exitCode, null,
+                        java.time.Instant.now()
+                );
             } else {
-                java.io.InputStream errorStream = process.getErrorStream();
-                String errorMsg = new String(errorStream.readAllBytes());
-                System.err.println("Native mongodump engine extraction failed with exit code (" + exitCode + "): " + errorMsg);
+                System.err.println("Native mongodump failed with exit code (" + exitCode + "): " + stderrOutput[0]);
+                return new BackupResult(
+                        BackupResult.Status.FAILED,
+                        config.getDbName(), "mysql",
+                        outputPath.toAbsolutePath().toString(),
+                        0, durationMs, exitCode, stderrOutput[0],
+                        java.time.Instant.now()
+                );
             }
-
         } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - startTime;
             System.err.println("MongoDB Core Engine Stream Failure: " + e.getMessage());
+            return new BackupResult(
+                    BackupResult.Status.FAILED,
+                    config.getDbName(), "mysql",
+                    outputPath.toAbsolutePath().toString(),
+                    0, durationMs, -1, e.getMessage(),
+                    java.time.Instant.now()
+            );
         }
     }
 
