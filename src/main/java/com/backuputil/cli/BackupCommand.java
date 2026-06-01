@@ -1,5 +1,6 @@
 package com.backuputil.cli;
 
+import com.backuputil.config.AppConfig;
 import com.backuputil.config.DbConfig;
 import com.backuputil.service.DatabaseService;
 import com.backuputil.service.impl.MongoService;
@@ -41,6 +42,7 @@ public class BackupCommand implements Callable<Integer> {
 
     @Override
     public Integer call() throws Exception {
+        AppConfig.getInstance().printStatus();
         System.out.println ("Initializing workflow verification...");
 
         DbConfig config = new DbConfig (host, port, user, password, dbName, mock);
