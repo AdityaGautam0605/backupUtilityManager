@@ -9,8 +9,10 @@ import com.backuputil.service.impl.PostgresService;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import com.backuputil.model.BackupResult;
+import com.backuputil.ai.RootCauseAnalyser;
 
 import java.util.concurrent.Callable;
+
 
 @Command(name = "backup-util", mixinStandardHelpOptions = true, version = "1.0",
             description = "Database Backup Utility CLI")
@@ -43,6 +45,7 @@ public class BackupCommand implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         AppConfig.getInstance().printStatus();
+        RootCauseAnalyser analyser = new RootCauseAnalyser();
         System.out.println ("Initializing workflow verification...");
 
         DbConfig config = new DbConfig (host, port, user, password, dbName, mock);
@@ -73,11 +76,14 @@ public class BackupCommand implements Callable<Integer> {
 
            try{
                BackupResult result = dbService.backup(config, outputDir);
+               String analysis = analyser.analyse(result);
                if (result.getStatus() == BackupResult.Status.SUCCESS){
                    System.out.println("Backup completed: "+ result);
+                   System.out.println("\n[AI Analysis] " + analysis);
                    return 0;
                }else{
                    System.err.println("Backup failed: " + result);
+                   System.err.println("\n[AI Analysis] " + analysis);
                    return 1;
                }
            }catch (IllegalArgumentException e){

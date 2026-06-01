@@ -16,7 +16,7 @@ public class AppConfig {
     private static final AppConfig INSTANCE  = new AppConfig();
     public static AppConfig getInstance() {return INSTANCE;}
 
-    public String getAiApiKey(){return aiApiKey;}
+    public String getAnthropicApiKey(){return aiApiKey;}
     public boolean isMockAi(){return mockAi;}
 
     public boolean isAiEnabled(){
