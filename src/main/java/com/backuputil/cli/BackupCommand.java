@@ -1,7 +1,9 @@
 package com.backuputil.cli;
 
+import com.backuputil.ai.CompressionAdvisor;
 import com.backuputil.config.AppConfig;
 import com.backuputil.config.DbConfig;
+import com.backuputil.model.CompressionStrategy;
 import com.backuputil.service.DatabaseService;
 import com.backuputil.service.impl.MongoService;
 import com.backuputil.service.impl.MysqlService;
@@ -42,6 +44,9 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"--mock"}, description = "Mock Variable for testing", defaultValue = "false")
     private boolean mock;
 
+    @Option(names = {"--backup-frequency"}, description = "How many times per day you run backups", defaultValue = "1")
+    private int backupFrequencyPerDay;
+
     @Override
     public Integer call() throws Exception {
         AppConfig.getInstance().printStatus();
@@ -73,6 +78,8 @@ public class BackupCommand implements Callable<Integer> {
             if (!directory.exists()){
                 directory.mkdirs();
             }
+            final CompressionAdvisor compressionAdvisor = new CompressionAdvisor();
+            CompressionStrategy strategy = compressionAdvisor.adviseAndConfirm (config, backupFrequencyPerDay);
 
            try{
                BackupResult result = dbService.backup(config, outputDir);
