@@ -2,6 +2,7 @@ package com.backuputil.service.impl;
 
 import com.backuputil.config.DbConfig;
 import com.backuputil.model.BackupResult;
+import com.backuputil.model.CompressionStrategy;
 import com.backuputil.service.DatabaseService;
 
 import java.sql.Connection;
@@ -10,22 +11,22 @@ import java.sql.SQLException;
 
 public class PostgresService implements DatabaseService {
     @Override
-    public boolean testConnection (DbConfig config){
+    public boolean testConnection(DbConfig config) {
         String url = String.format("jdbc:postgresql://%s:%d/%s",
                 config.getHost(), config.getPort(), config.getDbName());
 
         System.out.println("Testing database handshake at: " + url);
 
-        try (Connection conn = DriverManager.getConnection(url, config.getUser(), config.getPassword())){
-            if (conn != null && !conn.isClosed()){
+        try (Connection conn = DriverManager.getConnection(url, config.getUser(), config.getPassword())) {
+            if (conn != null && !conn.isClosed()) {
                 System.out.println("Handshake successful! Database Credentials are valid. ");
                 return true;
             }
-        }catch (SQLException e){
-            System.out.println("Database Handshake Failed: "+ e.getMessage());
+        } catch (SQLException e) {
+            System.out.println("Database Handshake Failed: " + e.getMessage());
         }
 
-        if (config.isMock()){
+        if (config.isMock()) {
             System.out.println("Warning: bypassing failure gate via active --mock flag...");
             return true;
         }
@@ -33,25 +34,26 @@ public class PostgresService implements DatabaseService {
     }
 
     @Override
-    public BackupResult backup(DbConfig config, String outputDir) throws Exception{
+    public BackupResult backup(DbConfig config, String outputDir, CompressionStrategy strategy) {
         // Defensive Validation Check
-        if (config == null){
+        if (config == null) {
             throw new IllegalArgumentException("Backup Core Error: Database Configuration profile cannot be null. ");
         }
-        if (config.getPassword() == null){
+        if (config.getPassword() == null) {
             throw new IllegalArgumentException("Backup Core Error: Missing required parameter 'password. Operating system variables cannot accept null values.");
 
-        }if (config.getDbName()== null || config.getDbName().trim().isEmpty()){
+        }
+        if (config.getDbName() == null || config.getDbName().trim().isEmpty()) {
             throw new IllegalArgumentException("Backup Core Error: Target database name parameter cannot be empty. ");
 
         }
         // filename and directory setup
-        String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format (new java.util.Date());
-        String finalFileName = String.format("%s_%s_backup.sql.gz", config.getDbName(), timestamp);
+        String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
+        String finalFileName = String.format("%s_%s_backup.sql%s", config.getDbName(), timestamp, strategy.getExtension());
         java.nio.file.Path outputPath = java.nio.file.Paths.get(outputDir, finalFileName);
 
         System.out.println("Initiating streaming compression engine...");
-        System.out.println("Target destination path: "+ outputPath.toAbsolutePath());
+        System.out.println("Target destination path: " + outputPath.toAbsolutePath());
 
         // Native Process args setup
         String[] command = {
@@ -80,29 +82,31 @@ public class PostgresService implements DatabaseService {
         // This ensures the external process never stalls, while allowing our main thread to continue executing or safely wait for the process
         // to exit via proces.waitFor().
 
-        try{
+        try {
             Process process = pb.start();
 
             // capturing the stderr output reference (array trick for lambda capture)
             String[] stderrOutput = {""};
 
             // Drain stderr on a background thread to prevent deadlock
-            Thread stderrDrainer = Thread.ofVirtual().start(()->{
-                try{
+            Thread stderrDrainer = Thread.ofVirtual().start(() -> {
+                try {
                     stderrOutput[0] = new String(process.getErrorStream().readAllBytes());
-                }catch (Exception ignored){}
+                } catch (Exception ignored) {
+                }
                 // Explicitly ignoring exceptions here as process termination or stream closure
                 // can throw expected IOExceptions during cleanup.
             });
 
             try (java.io.InputStream processStdout = process.getInputStream();
-                java.io.FileOutputStream fileOutputStream = new java.io.FileOutputStream(outputPath.toFile());
-                java.util.zip.GZIPOutputStream gzipOutputStream = new java.util.zip.GZIPOutputStream(fileOutputStream)){
+                 java.io.FileOutputStream fileOutputStream = new java.io.FileOutputStream(outputPath.toFile());
+                 java.io.OutputStream compressedOutputStream = buildCompressionStream(strategy, fileOutputStream)) {
 
                 System.out.println("Pumping and compressing data streams concurrency..");
 
                 // Transfer the bytes directly from the process directly to the zip stream memory-safely.
-                processStdout.transferTo(gzipOutputStream);
+                System.out.println("Pumping and compressing...");
+                processStdout.transferTo(compressedOutputStream);
             }
 
 
@@ -111,7 +115,7 @@ public class PostgresService implements DatabaseService {
             stderrDrainer.join();// wait for stderr thread to finish
             long durationMs = System.currentTimeMillis() - startTime;
 
-            if (exitCode == 0){
+            if (exitCode == 0) {
                 System.out.println("Backup pipeline completed successfully ! ");
                 return new BackupResult(
                         BackupResult.Status.SUCCESS,
@@ -121,7 +125,7 @@ public class PostgresService implements DatabaseService {
                         durationMs, exitCode, null,
                         java.time.Instant.now()
                 );
-            }else {
+            } else {
                 // Read any error text thrown by pg_dump itself.
                 System.err.println("Native pg_dump failed with exit code (" + exitCode + "): " + stderrOutput[0]);
                 return new BackupResult(
@@ -132,7 +136,7 @@ public class PostgresService implements DatabaseService {
                         java.time.Instant.now()
                 );
             }
-        } catch (Exception e){
+        } catch (Exception e) {
             long durationMs = System.currentTimeMillis() - startTime;
             System.err.println("Core Engine Stream Failure: " + e.getMessage());
             return new BackupResult(
@@ -147,7 +151,52 @@ public class PostgresService implements DatabaseService {
     }
 
     @Override
-    public void restore (DbConfig config, String backupFilePath){
+    public void restore(DbConfig config, String backupFilePath) {
         System.out.println("Restore operation pending implementation...");
     }
+
+    private java.io.OutputStream buildCompressionStream(
+            com.backuputil.model.CompressionStrategy strategy,
+            java.io.FileOutputStream fileOutputStream) throws Exception {
+        return switch (strategy) {
+            case GZIP -> new java.util.zip.GZIPOutputStream(fileOutputStream);
+            case BZIP2 -> {
+                try {
+                    Class<?> bzip2Class = Class.forName(
+                            "org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream");
+                    yield (java.io.OutputStream) bzip2Class
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] BZIP2 library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+            case LZ4 -> {
+                try {
+                    Class<?> lz4Class = Class.forName(
+                            "net.jpountz.lz4.LZ4FrameOutputStream");
+                    yield (java.io.OutputStream) lz4Class
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] LZ4 library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+            case ZSTD -> {
+                try {
+                    Class<?> zstdClass = Class.forName(
+                            "com.github.luben.zstd.ZstdOutputStream");
+                    yield (java.io.OutputStream) zstdClass
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] ZSTD library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+        };
+    }
 }
+

@@ -1,6 +1,7 @@
 package com.backuputil.service.impl;
 
 import com.backuputil.config.DbConfig;
+import com.backuputil.model.CompressionStrategy;
 import com.backuputil.service.DatabaseService;
 import com.backuputil.model.BackupResult;
 
@@ -42,7 +43,7 @@ public class MysqlService implements DatabaseService {
     }
 
     @Override
-    public BackupResult backup (DbConfig config, String outputDir){
+    public BackupResult backup (DbConfig config, String outputDir, CompressionStrategy strategy){
         // Defensive validation checks
         if (config == null){
             throw new IllegalArgumentException("Backup Core Error: Database configuration profile cannot be null.");
@@ -52,7 +53,7 @@ public class MysqlService implements DatabaseService {
         }
 
         String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
-        String finalFileName = String.format("%s_%s_backup.sql.gz", config.getDbName(), timestamp);
+        String finalFileName = String.format("%s_%s_backup.sql%s", config.getDbName(), timestamp, strategy.getExtension());
         java.nio.file.Path outputPath = java.nio.file.Paths.get(outputDir, finalFileName);
 
         System.out.println ("Initiating MYSQL streaming compression engine....");
@@ -104,10 +105,10 @@ public class MysqlService implements DatabaseService {
             // Intercept standard output and pipe it through the GZIP compression layer
             try (java.io.InputStream processStdout = process.getInputStream();
                  java.io.FileOutputStream fileOutputStream = new java.io.FileOutputStream(outputPath.toFile());
-                 java.util.zip.GZIPOutputStream gzipOutputStream = new java.util.zip.GZIPOutputStream(fileOutputStream)) {
+                 java.io.OutputStream compressedOutputStream = buildCompressionStream(strategy, fileOutputStream)) {
 
-                System.out.println("Pumping and compressing MySQL streams concurrently...");
-                processStdout.transferTo(gzipOutputStream);
+                System.out.println("Pumping and compressing...");
+                processStdout.transferTo(compressedOutputStream);
             }
 
             int exitCode = process.waitFor();
@@ -151,6 +152,51 @@ public class MysqlService implements DatabaseService {
     @Override
     public void restore (DbConfig config, String backupFilePath){
         System.out.println("MySQL restore operation pending implementation...");
+    }
+
+    private java.io.OutputStream buildCompressionStream(
+            com.backuputil.model.CompressionStrategy strategy,
+            java.io.FileOutputStream fileOutputStream) throws Exception {
+
+        return switch (strategy) {
+            case GZIP -> new java.util.zip.GZIPOutputStream(fileOutputStream);
+            case BZIP2 -> {
+                try {
+                    Class<?> bzip2Class = Class.forName(
+                            "org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream");
+                    yield (java.io.OutputStream) bzip2Class
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] BZIP2 library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+            case LZ4 -> {
+                try {
+                    Class<?> lz4Class = Class.forName(
+                            "net.jpountz.lz4.LZ4FrameOutputStream");
+                    yield (java.io.OutputStream) lz4Class
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] LZ4 library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+            case ZSTD -> {
+                try {
+                    Class<?> zstdClass = Class.forName(
+                            "com.github.luben.zstd.ZstdOutputStream");
+                    yield (java.io.OutputStream) zstdClass
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] ZSTD library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+        };
     }
 }
 

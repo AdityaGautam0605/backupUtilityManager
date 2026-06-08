@@ -1,6 +1,7 @@
 package com.backuputil.service.impl;
 
 import com.backuputil.config.DbConfig;
+import com.backuputil.model.CompressionStrategy;
 import com.backuputil.service.DatabaseService;
 import com.backuputil.model.BackupResult;
 import com.mongodb.client.MongoClient;
@@ -10,24 +11,24 @@ import org.bson.Document;
 public class MongoService implements DatabaseService {
 
     @Override
-    public boolean testConnection (DbConfig config){
+    public boolean testConnection(DbConfig config) {
         // constructing the mongodb connection
-        String connectionString = String.format ("mongodb://%s:%s@%s:%d/%s?authSource=admin", config.getUser(), config.getPassword(), config.getHost(), config.getPort(), config.getDbName());
+        String connectionString = String.format("mongodb://%s:%s@%s:%d/%s?authSource=admin", config.getUser(), config.getPassword(), config.getHost(), config.getPort(), config.getDbName());
         System.out.println("Testing MongoDB database connection");
 
         // using the official mongoDB sync driver to validate the cluster link
-        try (MongoClient mongoClient = MongoClients.create(connectionString)){
+        try (MongoClient mongoClient = MongoClients.create(connectionString)) {
             // running a lightweight admin ping command to verify the active network link
             Document ping = mongoClient.getDatabase("admin").runCommand(new Document("ping", 1));
-            if (ping.containsKey("ok") && ((Number) ping.get("ok")).doubleValue() == 1){
+            if (ping.containsKey("ok") && ((Number) ping.get("ok")).doubleValue() == 1) {
                 System.out.println("Handshake successful! MongoDB cluster authentication is valid");
                 return true;
             }
-        }catch (Exception e){
-            System.out.println("MongoDB Handshake failed: "+ e.getMessage());
+        } catch (Exception e) {
+            System.out.println("MongoDB Handshake failed: " + e.getMessage());
         }
         // active mock check fallback for seamless local verification runs
-        if (config.isMock()){
+        if (config.isMock()) {
             System.out.println("Warning: bypassing failure gate via active --mock flag...");
             return true;
         }
@@ -35,13 +36,13 @@ public class MongoService implements DatabaseService {
     }
 
     @Override
-    public BackupResult backup (DbConfig config, String outputDir) {
+    public BackupResult backup(DbConfig config, String outputDir, CompressionStrategy strategy) {
         if (config == null) {
             throw new IllegalArgumentException("Backup Core Error: Database Configuration profile cannot be null");
         }
         String timestamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss").format(new java.util.Date());
         // MongoDB archives are binary dumps, so we use .bson.gz as our extension format
-        String finalFileName = String.format("%s_%s_backup.bson.gz", config.getDbName(), timestamp);
+        String finalFileName = String.format("%s_%s_backup.bson%s", config.getDbName(), timestamp, strategy.getExtension());
         java.nio.file.Path outputPath = java.nio.file.Paths.get(outputDir, finalFileName);
 
         System.out.println("Initiating MongoDB streaming compression engine...");
@@ -90,10 +91,10 @@ public class MongoService implements DatabaseService {
             // Stream and compress the binary BSON bytes into our local archive file
             try (java.io.InputStream processStdout = process.getInputStream();
                  java.io.FileOutputStream fileOutputStream = new java.io.FileOutputStream(outputPath.toFile());
-                 java.util.zip.GZIPOutputStream gzipOutputStream = new java.util.zip.GZIPOutputStream(fileOutputStream)) {
+                 java.io.OutputStream compressedOutputStream = buildCompressionStream(strategy, fileOutputStream)) {
 
-                System.out.println("Pumping and compressing MongoDB binary streams concurrently...");
-                processStdout.transferTo(gzipOutputStream);
+                System.out.println("Pumping and compressing...");
+                processStdout.transferTo(compressedOutputStream);
             }
 
             int exitCode = process.waitFor();
@@ -137,5 +138,49 @@ public class MongoService implements DatabaseService {
     public void restore(DbConfig config, String backupFilePath) {
         System.out.println("MongoDB restore operation pending implementation...");
     }
+
+    private java.io.OutputStream buildCompressionStream(
+            com.backuputil.model.CompressionStrategy strategy,
+            java.io.FileOutputStream fileOutputStream) throws Exception {
+        return switch (strategy) {
+            case GZIP -> new java.util.zip.GZIPOutputStream(fileOutputStream);
+            case BZIP2 -> {
+                try {
+                    Class<?> bzip2Class = Class.forName(
+                            "org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream");
+                    yield (java.io.OutputStream) bzip2Class
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] BZIP2 library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+            case LZ4 -> {
+                try {
+                    Class<?> lz4Class = Class.forName(
+                            "net.jpountz.lz4.LZ4FrameOutputStream");
+                    yield (java.io.OutputStream) lz4Class
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] LZ4 library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+            case ZSTD -> {
+                try {
+                    Class<?> zstdClass = Class.forName(
+                            "com.github.luben.zstd.ZstdOutputStream");
+                    yield (java.io.OutputStream) zstdClass
+                            .getConstructor(java.io.OutputStream.class)
+                            .newInstance(fileOutputStream);
+                } catch (ClassNotFoundException e) {
+                    System.out.println("[Compression] ZSTD library not found — falling back to GZIP");
+                    yield new java.util.zip.GZIPOutputStream(fileOutputStream);
+                }
+            }
+        };
     }
+}
 

@@ -82,7 +82,7 @@ public class BackupCommand implements Callable<Integer> {
             CompressionStrategy strategy = compressionAdvisor.adviseAndConfirm (config, backupFrequencyPerDay);
 
            try{
-               BackupResult result = dbService.backup(config, outputDir);
+               BackupResult result = dbService.backup(config, outputDir, strategy);
                String analysis = analyser.analyse(result);
                if (result.getStatus() == BackupResult.Status.SUCCESS){
                    System.out.println("Backup completed: "+ result);
