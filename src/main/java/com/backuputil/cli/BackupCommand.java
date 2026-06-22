@@ -12,6 +12,8 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import com.backuputil.model.BackupResult;
 import com.backuputil.ai.RootCauseAnalyser;
+import com.backuputil.ai.NaturalLanguageParser;
+import com.backuputil.model.ParsedIntent;
 
 import java.util.concurrent.Callable;
 
@@ -23,7 +25,7 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"-o", "--output"}, description = "Directory folder path to store backups", defaultValue = "./backups")
     private String outputDir;
 
-    @Option(names = {"-t", "--type"}, description = "DBMS type (postgres, mysql)", required = true)
+    @Option(names = {"-t", "--type"}, description = "DBMS type (postgres, mysql)")
     private String dbType;
 
     @Option(names = {"-H", "--host"}, description = "Database host address", defaultValue = "localhost")
@@ -32,13 +34,13 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"-p", "--port"}, description = "Database port", defaultValue = "5432")
     private int port;
 
-    @Option(names = {"-u", "--user"}, description = "Database username", required = true)
+    @Option(names = {"-u", "--user"}, description = "Database username")
     private String user;
 
     @Option(names = {"-P", "--password"}, description = "Database password", interactive = true, prompt = "Enter database password: ")
     private String password;
 
-    @Option(names = {"-d", "--database"}, description = "Target database name", required = true)
+    @Option(names = {"-d", "--database"}, description = "Target database name")
     private String dbName;
 
     @Option(names = {"--mock"}, description = "Mock Variable for testing", defaultValue = "false")
@@ -47,9 +49,26 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"--backup-frequency"}, description = "How many times per day you run backups", defaultValue = "1")
     private int backupFrequencyPerDay;
 
+    @Option(names = {"--nl"}, description = "Describe what you want in natural language, e.g. \"backup my postgres database called shop_db on localhost\"")
+    private String naturalLanguageInput;
+
     @Override
     public Integer call() throws Exception {
         AppConfig.getInstance().printStatus();
+
+        if (naturalLanguageInput != null && !naturalLanguageInput.isBlank()) {
+            resolveFromNaturalLanguage();
+        }
+
+        if (dbType == null || dbType.isBlank()) {
+            dbType = promptForValue("Enter DBMS type (postgres/mysql/mongo): ");
+        }
+        if (user == null || user.isBlank()) {
+            user = promptForValue("Enter database username: ");
+        }
+        if (dbName == null || dbName.isBlank()) {
+            dbName = promptForValue("Enter target database name: ");
+        }
         RootCauseAnalyser analyser = new RootCauseAnalyser();
         System.out.println ("Initializing workflow verification...");
 
@@ -105,5 +124,29 @@ public class BackupCommand implements Callable<Integer> {
             System.out.println("Workflow terminated early due to verification failure.");
             return 1;
         }
+    }
+
+    private void resolveFromNaturalLanguage() {
+        System.out.println("[NL Parser] Interpreting: \"" + naturalLanguageInput + "\"");
+        NaturalLanguageParser parser = new NaturalLanguageParser();
+        ParsedIntent intent = parser.parse(naturalLanguageInput);
+
+        if (intent.getDbType() != null) { dbType = intent.getDbType(); System.out.println("[NL Parser] Detected DB type: " + dbType); }
+        if (intent.getHost() != null)   { host = intent.getHost();     System.out.println("[NL Parser] Detected host: " + host); }
+        if (intent.getPort() != null)   { port = intent.getPort();     System.out.println("[NL Parser] Detected port: " + port); }
+        if (intent.getUser() != null)   { user = intent.getUser();     System.out.println("[NL Parser] Detected user: " + user); }
+        if (intent.getDbName() != null) { dbName = intent.getDbName(); System.out.println("[NL Parser] Detected database: " + dbName); }
+        if (intent.isMock())            { mock = true;                 System.out.println("[NL Parser] Mock mode detected"); }
+
+        System.out.println("[NL Parser] Note: passwords are never parsed from natural language — you'll be prompted separately.\n");
+    }
+
+    private String promptForValue(String promptText) {
+        java.io.Console console = System.console();
+        if (console != null) {
+            return console.readLine(promptText);
+        }
+        System.out.print(promptText);
+        return new java.util.Scanner(System.in).nextLine();
     }
 }
