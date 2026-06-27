@@ -11,8 +11,11 @@ import com.backuputil.service.impl.PostgresService;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import com.backuputil.model.BackupResult;
+import com.backuputil.model.RestoreResult;
 import com.backuputil.ai.RootCauseAnalyser;
 import com.backuputil.ai.NaturalLanguageParser;
+import com.backuputil.ai.RestoreAdvisor;
+import com.backuputil.ai.BackupReportGenerator;
 import com.backuputil.model.ParsedIntent;
 
 import java.util.concurrent.Callable;
@@ -52,6 +55,15 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"--nl"}, description = "Describe what you want in natural language, e.g. \"backup my postgres database called shop_db on localhost\"")
     private String naturalLanguageInput;
 
+    @Option(names = {"--restore"}, description = "Enter restore mode — interactively pick a backup to restore (point-in-time)", defaultValue = "false")
+    private boolean restoreMode;
+
+    @Option(names = {"--restore-file"}, description = "Restore directly from a specific backup file path (skips the picker)")
+    private String restoreFile;
+
+    @Option(names = {"--report"}, description = "Also write the post-backup report to a .txt file in the output directory", defaultValue = "false")
+    private boolean writeReport;
+
     @Override
     public Integer call() throws Exception {
         AppConfig.getInstance().printStatus();
@@ -74,56 +86,96 @@ public class BackupCommand implements Callable<Integer> {
 
         DbConfig config = new DbConfig (host, port, user, password, dbName, mock);
 
-        DatabaseService dbService;
-
-        if ("postgres".equalsIgnoreCase(dbType)){
-            dbService = new PostgresService();
-        }else if ("mysql".equalsIgnoreCase(dbType)){
-            dbService = new MysqlService();
-        }else if ("mongo".equalsIgnoreCase(dbType)){
-            dbService = new MongoService();
-        }
-        else{
+        DatabaseService dbService = createService(dbType);
+        if (dbService == null){
             System.out.println ("Error: Unsupported Database management system engine: "+ dbType);
             return 1;
         }
 
         boolean isConnected = dbService.testConnection(config);
-
-        if (isConnected){
-            System.out.println("Ready for backup processing pipeline");
-
-            java.io.File directory = new java.io.File(outputDir);
-            if (!directory.exists()){
-                directory.mkdirs();
-            }
-            final CompressionAdvisor compressionAdvisor = new CompressionAdvisor();
-            CompressionStrategy strategy = compressionAdvisor.adviseAndConfirm (config, backupFrequencyPerDay);
-
-           try{
-               BackupResult result = dbService.backup(config, outputDir, strategy);
-               String analysis = analyser.analyse(result);
-               if (result.getStatus() == BackupResult.Status.SUCCESS){
-                   System.out.println("Backup completed: "+ result);
-                   System.out.println("\n[AI Analysis] " + analysis);
-                   return 0;
-               }else{
-                   System.err.println("Backup failed: " + result);
-                   System.err.println("\n[AI Analysis] " + analysis);
-                   return 1;
-               }
-           }catch (IllegalArgumentException e){
-               System.err.println(e.getMessage());
-               System.err.println("Workflow aborted safely due to configuration constraints.");
-               return 1;
-           } catch (Exception e){
-               System.err.println ("Unexpected runtime pipeline error: " + e.getMessage());
-               return 1;
-           }
-        }else{
+        if (!isConnected){
             System.out.println("Workflow terminated early due to verification failure.");
             return 1;
         }
+
+        // Phase 4 — restore mode takes priority over backup when requested.
+        boolean doRestore = restoreMode || (restoreFile != null && !restoreFile.isBlank());
+        if (doRestore){
+            return runRestore(dbService, config);
+        }
+
+        return runBackup(dbService, config, analyser);
+    }
+
+    private DatabaseService createService(String type){
+        if ("postgres".equalsIgnoreCase(type)) return new PostgresService();
+        if ("mysql".equalsIgnoreCase(type))    return new MysqlService();
+        if ("mongo".equalsIgnoreCase(type))     return new MongoService();
+        return null;
+    }
+
+    private int runBackup(DatabaseService dbService, DbConfig config, RootCauseAnalyser analyser){
+        System.out.println("Ready for backup processing pipeline");
+
+        java.io.File directory = new java.io.File(outputDir);
+        if (!directory.exists() && !directory.mkdirs()){
+            System.err.println("Error: could not create output directory: " + directory.getAbsolutePath());
+            return 1;
+        }
+
+        final CompressionAdvisor compressionAdvisor = new CompressionAdvisor();
+        CompressionStrategy strategy = compressionAdvisor.adviseAndConfirm (dbService, config, backupFrequencyPerDay);
+
+        try{
+            BackupResult result = dbService.backup(config, outputDir, strategy);
+            String analysis = analyser.analyse(result);
+
+            if (result.getStatus() == BackupResult.Status.SUCCESS){
+                System.out.println("Backup completed: "+ result);
+                System.out.println("\n[AI Analysis] " + analysis);
+            }else{
+                System.err.println("Backup failed: " + result);
+                System.err.println("\n[AI Analysis] " + analysis);
+            }
+
+            // Phase 4 — human-readable report with trends.
+            emitReport(result);
+
+            return result.getStatus() == BackupResult.Status.SUCCESS ? 0 : 1;
+        }catch (IllegalArgumentException e){
+            System.err.println(e.getMessage());
+            System.err.println("Workflow aborted safely due to configuration constraints.");
+            return 1;
+        } catch (Exception e){
+            System.err.println ("Unexpected runtime pipeline error: " + e.getMessage());
+            return 1;
+        }
+    }
+
+    private void emitReport(BackupResult result){
+        BackupReportGenerator reporter = new BackupReportGenerator();
+        String report = reporter.generate(result, outputDir);
+        System.out.println("\n" + report);
+        if (writeReport){
+            try{
+                java.nio.file.Path saved = reporter.writeToFile(report, outputDir, result.getDbName());
+                System.out.println("[Report] Saved to: " + saved.toAbsolutePath());
+            }catch (Exception e){
+                System.err.println("[Report] Could not write report file: " + e.getMessage());
+            }
+        }
+    }
+
+    private int runRestore(DatabaseService dbService, DbConfig config){
+        RestoreAdvisor advisor = new RestoreAdvisor();
+        RestoreResult result = advisor.adviseAndRestore(dbService, config, outputDir, restoreFile, dbType);
+
+        if (result.getStatus() == RestoreResult.Status.SUCCESS){
+            System.out.println("\nRestore completed: " + result);
+            return 0;
+        }
+        System.err.println("\nRestore did not complete: " + result);
+        return 1;
     }
 
     private void resolveFromNaturalLanguage() {

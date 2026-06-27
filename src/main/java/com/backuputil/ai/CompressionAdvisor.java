@@ -2,6 +2,7 @@ package com.backuputil.ai;
 
 import com.backuputil.config.*;
 import com.backuputil.model.CompressionStrategy;
+import com.backuputil.service.DatabaseService;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -21,19 +22,19 @@ public class CompressionAdvisor {
     }
 
     // Step 1 — detect DB size automatically, don't ask the user
-    public CompressionStrategy adviseAndConfirm(DbConfig dbConfig, int backupFrequencyPerDay) {
+    public CompressionStrategy adviseAndConfirm(DatabaseService service, DbConfig dbConfig, int backupFrequencyPerDay) {
 
-        long estimatedSizeBytes = estimateDbSize(dbConfig);
-        long sizeInMB = estimatedSizeBytes / (1024 * 1024);
+        long estimatedSizeBytes = estimateDbSize(service, dbConfig);
 
         CompressionStrategy recommended = recommend(estimatedSizeBytes, backupFrequencyPerDay);
-        String reasoning = buildReasoning(recommended, sizeInMB, backupFrequencyPerDay);
+        String reasoning = buildReasoning(recommended, estimatedSizeBytes, backupFrequencyPerDay);
 
         // Check availability of all strategies once — cache results
         Map<CompressionStrategy, Boolean> availability = checkAvailability();
 
         // Print recommendation
-        System.out.println("\n[AI Compression Advisor] Detected database size: ~" + sizeInMB + "MB");
+        String sizeLabel = estimatedSizeBytes < 0 ? "unknown" : "~" + (estimatedSizeBytes / (1024 * 1024)) + "MB";
+        System.out.println("\n[AI Compression Advisor] Detected database size: " + sizeLabel);
         System.out.println("[AI Compression Advisor] Recommended: " + recommended.name());
         System.out.println("[AI Compression Advisor] Reason: " + reasoning);
 
@@ -104,42 +105,53 @@ public class CompressionAdvisor {
         return result;
     }
 
-    // Estimate DB size by checking the data directory size via the DB CLI
-    // Falls back to a conservative default if detection fails
-    private long estimateDbSize(DbConfig config) {
-        try {
-            // pg_database_size / information_schema approach could work here
-            // For now return a safe default — real implementation would query the DB
-            System.out.println("[AI Compression Advisor] Estimating database size...");
-            return 100L * 1024 * 1024; // 100MB default
-        } catch (Exception e) {
-            return 100L * 1024 * 1024;
+    // Ask the database itself how big it is (pg_database_size / information_schema / dbStats).
+    // Returns a negative sentinel when the size can't be determined (mock mode, query failure).
+    private long estimateDbSize(DatabaseService service, DbConfig config) {
+        System.out.println("[AI Compression Advisor] Estimating database size...");
+        long size = service.estimateSizeBytes(config);
+        if (size < 0) {
+            System.out.println("[AI Compression Advisor] Size unavailable — using a balanced default");
         }
+        return size;
     }
 
+    // Thresholds use inclusive boundaries so every real size lands in exactly one branch
+    // (the previous "< 100" / "> 500" pair left a gap that always fell through to ZSTD).
     private CompressionStrategy recommend(long estimatedSizeBytes, int backupFrequencyPerDay) {
-        long sizeInMB = estimatedSizeBytes / (1024 * 1024);
+        // Unknown size — play it safe with the balanced default.
+        if (estimatedSizeBytes < 0) {
+            return CompressionStrategy.ZSTD;
+        }
 
-        if (sizeInMB > 500 && backupFrequencyPerDay > 2) {
-            return CompressionStrategy.LZ4;
+        long sizeInMB = estimatedSizeBytes / (1024 * 1024);
+        boolean large = sizeInMB >= 500;
+        boolean small = sizeInMB <= 100;
+        boolean frequent = backupFrequencyPerDay >= 2;
+
+        if (large && frequent) {
+            return CompressionStrategy.LZ4;   // big + often → speed dominates
         }
-        if (sizeInMB < 100 && backupFrequencyPerDay <= 1) {
-            return CompressionStrategy.BZIP2;
+        if (small && !frequent) {
+            return CompressionStrategy.BZIP2; // small + rare → squeeze hardest, time is cheap
         }
-        return CompressionStrategy.ZSTD;
+        return CompressionStrategy.ZSTD;      // everything in between → balanced
     }
 
-    private String buildReasoning(CompressionStrategy strategy, long sizeInMB, int backupFrequencyPerDay) {
+    private String buildReasoning(CompressionStrategy strategy, long estimatedSizeBytes, int backupFrequencyPerDay) {
+        String size = estimatedSizeBytes < 0
+                ? "unknown size"
+                : String.format("~%dMB", estimatedSizeBytes / (1024 * 1024));
         return switch (strategy) {
             case LZ4 -> String.format(
-                    "DB is large (~%dMB) and backed up %dx/day — speed takes priority over compression ratio",
-                    sizeInMB, backupFrequencyPerDay);
+                    "DB is large (%s) and backed up %dx/day — speed takes priority over compression ratio",
+                    size, backupFrequencyPerDay);
             case BZIP2 -> String.format(
-                    "DB is small (~%dMB) with infrequent backups — maximising compression ratio",
-                    sizeInMB);
+                    "DB is small (%s) with infrequent backups — maximising compression ratio",
+                    size);
             case ZSTD -> String.format(
-                    "DB size (~%dMB) with %dx/day frequency — ZSTD gives the best speed/ratio balance",
-                    sizeInMB, backupFrequencyPerDay);
+                    "DB size %s with %dx/day frequency — ZSTD gives the best speed/ratio balance",
+                    size, backupFrequencyPerDay);
             case GZIP -> "Falling back to GZIP for maximum compatibility";
         };
     }

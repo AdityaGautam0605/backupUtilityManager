@@ -2,6 +2,7 @@ package com.backuputil.ai;
 
 import com.backuputil.config.AppConfig;
 import com.backuputil.model.BackupResult;
+import com.backuputil.util.ClaudeResponse;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -133,21 +134,10 @@ public class RootCauseAnalyser {
         }
     }
 
-    // Extracts the text content from Claude's JSON response
+    // Extracts the text content from Claude's JSON response (escape-aware, no external lib)
     private String parseClaudeResponse(String responseBody){
-        try{
-            // simple parsing without external JSON library
-            int contentIndex = responseBody.indexOf("\"text\":");
-            if (contentIndex == -1) return "[AI] Could not parse response";
-
-            int start = responseBody.indexOf("\"", contentIndex + 7) + 1;
-            int end = responseBody.lastIndexOf("\"");
-            return responseBody.substring(start, end)
-                    .replace("\\n", "\n")
-                    .replace("\\\"", "\"");
-        } catch (Exception e){
-            return "[AI] Could not parse response: " + e.getMessage();
-        }
+        String text = ClaudeResponse.extractText(responseBody);
+        return text != null ? text : "[AI] Could not parse response";
     }
 
     // escape special characters for JSON string embedding

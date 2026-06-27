@@ -3,13 +3,21 @@ package com.backuputil.service.impl;
 import com.backuputil.config.DbConfig;
 import com.backuputil.model.BackupResult;
 import com.backuputil.model.CompressionStrategy;
+import com.backuputil.model.RestoreResult;
 import com.backuputil.service.DatabaseService;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 
 public class PostgresService implements DatabaseService {
+
+    // Per-run cache: the DB size captured during testConnection so the compression
+    // advisor doesn't have to open a second connection moments later. null = not yet known.
+    private Long cachedSizeBytes = null;
+
     @Override
     public boolean testConnection(DbConfig config) {
         String url = String.format("jdbc:postgresql://%s:%d/%s",
@@ -20,6 +28,8 @@ public class PostgresService implements DatabaseService {
         try (Connection conn = DriverManager.getConnection(url, config.getUser(), config.getPassword())) {
             if (conn != null && !conn.isClosed()) {
                 System.out.println("Handshake successful! Database Credentials are valid. ");
+                // Reuse this live connection to capture the DB size in the same round-trip.
+                cachedSizeBytes = querySizeBytes(conn, config.getDbName());
                 return true;
             }
         } catch (SQLException e) {
@@ -31,6 +41,39 @@ public class PostgresService implements DatabaseService {
             return true;
         }
         return false;
+    }
+
+    @Override
+    public long estimateSizeBytes(DbConfig config) {
+        // Captured during testConnection in the normal flow — return it without reconnecting.
+        if (cachedSizeBytes != null) return cachedSizeBytes;
+
+        // No live database to measure in mock mode.
+        if (config == null || config.isMock()) return -1;
+
+        // Fallback for callers that skipped testConnection. Short timeouts so a wrong host fails fast.
+        String url = String.format("jdbc:postgresql://%s:%d/%s?connectTimeout=5&socketTimeout=10",
+                config.getHost(), config.getPort(), config.getDbName());
+
+        try (Connection conn = DriverManager.getConnection(url, config.getUser(), config.getPassword())) {
+            cachedSizeBytes = querySizeBytes(conn, config.getDbName());
+            return cachedSizeBytes;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    // Best-effort size query on an already-open connection. Returns -1 if it can't be read.
+    private long querySizeBytes(Connection conn, String dbName) {
+        try (PreparedStatement ps = conn.prepareStatement("SELECT pg_database_size(?)")) {
+            ps.setString(1, dbName);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getLong(1);
+            }
+        } catch (Exception e) {
+            // ignore — size is advisory only
+        }
+        return -1;
     }
 
     @Override
@@ -151,8 +194,91 @@ public class PostgresService implements DatabaseService {
     }
 
     @Override
-    public void restore(DbConfig config, String backupFilePath) {
-        System.out.println("Restore operation pending implementation...");
+    public RestoreResult restore(DbConfig config, String backupFilePath) {
+        long startTime = System.currentTimeMillis();
+        java.nio.file.Path source = java.nio.file.Paths.get(backupFilePath);
+
+        if (config == null || config.getPassword() == null) {
+            return new RestoreResult(RestoreResult.Status.ABORTED,
+                    config == null ? "?" : config.getDbName(), "postgres", backupFilePath,
+                    0, 0, -1, "Configuration or password missing", java.time.Instant.now());
+        }
+        if (!java.nio.file.Files.exists(source)) {
+            return new RestoreResult(RestoreResult.Status.ABORTED,
+                    config.getDbName(), "postgres", backupFilePath,
+                    0, 0, -1, "Backup file not found: " + backupFilePath, java.time.Instant.now());
+        }
+
+        CompressionStrategy strategy = CompressionStrategy.fromFileName(source.getFileName().toString());
+        System.out.println("Restoring postgres database '" + config.getDbName() + "' from " + source.toAbsolutePath());
+        System.out.println("Decompressing via " + strategy.name() + " and streaming into psql...");
+
+        // pg_dump produced a plain SQL script (-Fp), so we replay it through psql's stdin.
+        String[] command = {
+                "psql",
+                "-h", config.getHost(),
+                "-p", String.valueOf(config.getPort()),
+                "-U", config.getUser(),
+                "-d", config.getDbName()
+        };
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.environment().put("PGPASSWORD", config.getPassword());
+
+        try {
+            Process process = pb.start();
+
+            // Drain both stderr AND stdout on background virtual threads. psql is a
+            // consumer here, but it still emits notices/output that must be read to
+            // avoid the same OS-buffer deadlock the backup path guards against.
+            String[] stderrOutput = {""};
+            Thread stderrDrainer = Thread.ofVirtual().start(() -> {
+                try {
+                    stderrOutput[0] = new String(process.getErrorStream().readAllBytes(),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                } catch (Exception ignored) {
+                }
+            });
+            Thread stdoutDrainer = Thread.ofVirtual().start(() -> {
+                try {
+                    process.getInputStream().readAllBytes();
+                } catch (Exception ignored) {
+                }
+            });
+
+            long bytesRestored;
+            // Closing the process stdin (end of try-with-resources) signals EOF to psql.
+            try (java.io.InputStream fileIn = java.nio.file.Files.newInputStream(source);
+                 java.io.InputStream decompressed = com.backuputil.util.CompressionStreams.wrapDecompress(fileIn, strategy);
+                 java.io.OutputStream toProcess = process.getOutputStream()) {
+
+                System.out.println("Replaying SQL into the live database...");
+                bytesRestored = decompressed.transferTo(toProcess);
+            }
+
+            int exitCode = process.waitFor();
+            stderrDrainer.join();
+            stdoutDrainer.join();
+            long durationMs = System.currentTimeMillis() - startTime;
+
+            if (exitCode == 0) {
+                System.out.println("Restore pipeline completed successfully!");
+                return new RestoreResult(RestoreResult.Status.SUCCESS,
+                        config.getDbName(), "postgres", source.toAbsolutePath().toString(),
+                        bytesRestored, durationMs, exitCode, null, java.time.Instant.now());
+            } else {
+                System.err.println("Native psql failed with exit code (" + exitCode + "): " + stderrOutput[0]);
+                return new RestoreResult(RestoreResult.Status.FAILED,
+                        config.getDbName(), "postgres", source.toAbsolutePath().toString(),
+                        bytesRestored, durationMs, exitCode, stderrOutput[0], java.time.Instant.now());
+            }
+        } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - startTime;
+            System.err.println("Restore Engine Stream Failure: " + e.getMessage());
+            return new RestoreResult(RestoreResult.Status.FAILED,
+                    config.getDbName(), "postgres", source.toAbsolutePath().toString(),
+                    0, durationMs, -1, e.getMessage(), java.time.Instant.now());
+        }
     }
 
     private java.io.OutputStream buildCompressionStream(

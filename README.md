@@ -11,7 +11,9 @@ com.backuputil/
 ├── ai/
 │   ├── RootCauseAnalyser.java      — AI-powered failure/success analysis
 │   ├── CompressionAdvisor.java     — recommends + confirms compression strategy
-│   └── NaturalLanguageParser.java  — parses plain English into backup config
+│   ├── NaturalLanguageParser.java  — parses plain English into backup config
+│   ├── RestoreAdvisor.java         — AI-guided interactive restore (point-in-time + decompression detection)
+│   └── BackupReportGenerator.java  — human-readable post-backup report with trends
 ├── cli/
 │   └── BackupCommand.java          — picocli entrypoint, wires everything together
 ├── config/
@@ -19,8 +21,11 @@ com.backuputil/
 │   └── DbConfig.java               — immutable DB connection config
 ├── model/
 │   ├── BackupResult.java           — structured result of a backup run
-│   ├── CompressionStrategy.java    — enum: GZIP, BZIP2, LZ4, ZSTD
+│   ├── RestoreResult.java          — structured result of a restore run
+│   ├── CompressionStrategy.java    — enum: GZIP, BZIP2, LZ4, ZSTD (+ extension auto-detect)
 │   └── ParsedIntent.java           — output of natural language parsing
+├── util/
+│   └── CompressionStreams.java     — decompression helpers (magic-byte aware) for restore
 └── service/
     ├── DatabaseService.java        — interface
     └── impl/
@@ -65,14 +70,35 @@ org.example/  (legacy package — Main.java still lives here, should be moved to
 - Missing required fields (`-t`, `-u`, `-d`) are now optional at the CLI level and get interactively prompted if still missing after NL parsing
 - Tested end-to-end with real Postgres connection attempts — works correctly
 
+### Phase 4 — Restore + Report
+- `restore()` is now implemented in all three services (was a stub). Each decompresses the archive and streams it into the native client:
+    - Postgres → `psql` stdin, password via `PGPASSWORD`
+    - MySQL → `mysql` client stdin, password via `MYSQL_PWD`
+    - Mongo → `mongorestore --archive` stdin
+    - Same background-virtual-thread draining used on backup, applied to both stdout and stderr to avoid the OS-buffer deadlock
+- `RestoreResult` — structured restore outcome (status, db, source, bytes restored, duration, exit code, error, timestamp)
+- `RestoreAdvisor` — AI-guided interactive restore:
+    - **Point-in-time selection**: lists existing backups for the database (timestamp + size parsed from filenames), user picks the snapshot
+    - **Decompression auto-detection** from the file extension, with a magic-byte safety net (a file labelled `.zst` that actually holds GZIP bytes — the current backup fallback reality — is still read correctly)
+    - **Destructive-operation confirmation gate** before touching the live database
+    - **AI guidance**: rule-based safety briefing in mock mode, Claude in real mode (graceful fallback)
+- `BackupReportGenerator` — human-readable post-backup report:
+    - Summary (status, size, duration, throughput, exit code) plus a **Trends** section derived by scanning prior backups on disk (count, total size, delta vs previous run) and **recommendations** (growth spikes, 0-byte archives, pruning suggestions)
+    - Printed after every backup; `--report` also writes it to `<db>_<timestamp>_report.txt`
+- New CLI flags: `--restore` (interactive picker), `--restore-file <path>` (direct), `--report`
+- `util/CompressionStreams` — centralised, magic-byte-aware decompression for the restore path
+- **Correctness fixes made alongside this phase:** MySQL backup now actually passes the password (`MYSQL_PWD` was never set — real MySQL backups were broken); MySQL error-path and Mongo result objects now report the correct `dbType` (were hard-coded to the wrong engine)
+
+### Follow-up fixes (compression heuristic + JSON parsing)
+- **Compression advisor now uses the real database size.** `estimateDbSize()` was hard-coded to 100 MB, and with the old `> 500` / `< 100` thresholds the recommendation *always* came out ZSTD. Each service now implements `estimateSizeBytes()` (`pg_database_size` / `information_schema` sum / Mongo `dbStats.dataSize`), the advisor feeds that real number in, and the thresholds use inclusive boundaries so every size lands in exactly one tier (mock mode / query failure → balanced ZSTD default).
+  - The size is captured **during** `testConnection` on the connection it already opens (cached per run), so the advisor reuses it instead of opening a second connection. `estimateSizeBytes()` keeps a standalone fallback for callers that skip the connection test.
+- **Robust Claude response parsing.** The old `indexOf("text") … lastIndexOf("\"")` approach captured trailing JSON (`stop_reason`, `usage`) on real API responses. Replaced with a single escape-aware extractor, `util/ClaudeResponse.extractText()`, now used by `RootCauseAnalyser`, `NaturalLanguageParser`, and `RestoreAdvisor`.
+
+> Note: implemented but not yet compiled/run on this machine (no JDK/Maven on PATH) — build + smoke-test in IntelliJ before relying on it.
+
 ---
 
 ## What's Pending
-
-### Phase 4 — Restore + Report (not started)
-- `RestoreAdvisor` — AI-guided interactive restore (point-in-time selection, decompression strategy auto-detection from file extension)
-- `BackupReportGenerator` — human-readable post-backup summary with trends and recommendations
-- All three services currently have `restore()` as a stub (`"...pending implementation"`)
 
 ### Phase 5 — Cloud Upload (not started, deferred — cost)
 - `CloudUploader` interface only for now
@@ -100,9 +126,9 @@ Design already discussed and ready to implement when ready:
 ### Known Outstanding Issues
 - `Main.java` still sits in `org.example` package — should be moved to `com.backuputil` for consistency
 - Password masking in terminal input — currently picocli's `interactive=true` echoes the password in plaintext in some terminal contexts (e.g. IntelliJ Run window). A more robust fix using `System.console().readPassword()` was designed but deliberately skipped for now as a low-priority cosmetic issue
-- BZIP2/LZ4/ZSTD Maven dependencies need correct group IDs verified before compression actually uses anything other than GZIP fallback (current `pom.xml` entries had incorrect coordinates for LZ4 — needs fixing: likely `net.jpountz.lz4:lz4:1.3.0` rather than `org.lz4:lz4-java`)
+- BZIP2/LZ4/ZSTD Maven dependencies need correct group IDs verified before compression actually uses anything other than GZIP fallback (current `pom.xml` entries had incorrect coordinates for LZ4 — needs fixing: likely `net.jpountz.lz4:lz4:1.3.0` rather than `org.lz4:lz4-java`). Until then, every archive is GZIP regardless of the `.zst`/`.bz2`/`.lz4` extension chosen — restore handles this via magic-byte detection
 - No unit tests yet anywhere in the project
-- No `restore()` implementation in any of the three services
+- MongoDB still passes `--password` as a process argument (visible in `ps aux`) on both backup and restore — unlike Postgres/MySQL which use env vars. mongodump/mongorestore have no password env var, so this needs a different approach (e.g. `--config` file or stdin)
 
 ---
 
@@ -119,9 +145,39 @@ Design already discussed and ready to implement when ready:
 
 1. Learn FastAPI, encryption fundamentals, and authentication basics (in progress)
 2. Implement the Encryption + Security layer using the design above
-3. Phase 4 — Restore + Report
-4. Move `Main.java` to `com.backuputil` package
-5. Fix compression library Maven coordinates (BZIP2/LZ4/ZSTD)
-6. Add unit tests
-7. Phase 5 — Cloud Upload (S3) once budget allows
-8. Write a proper architecture diagram for the README (for resume/portfolio presentation)
+3. Move `Main.java` to `com.backuputil` package
+4. Fix compression library Maven coordinates (BZIP2/LZ4/ZSTD)
+5. Add unit tests
+6. Phase 5 — Cloud Upload (S3) once budget allows
+7. Write a proper architecture diagram for the README (for resume/portfolio presentation)
+
+---
+
+## Development Log
+
+### 2026-06-27 — Phase 4 + flaw fixes
+
+**Phase 4 (Restore + Report) implemented**
+- `restore()` is now real in all three services — decompress the archive and stream it into `psql` / `mysql` / `mongorestore --archive` via stdin, with the same dual virtual-thread draining the backup path uses. The interface now returns a structured `RestoreResult`.
+- `RestoreAdvisor` — AI-guided interactive restore: point-in-time picker (snapshots parsed from filenames), extension-based decompression auto-detect with a magic-byte safety net, destructive-operation confirmation gate, and AI guidance (rule-based in mock mode, Claude in real mode).
+- `BackupReportGenerator` — human-readable report with a Trends section (count, total size, delta vs previous run) and recommendations, derived by scanning prior backups on disk.
+- `util/CompressionStreams` — centralised, magic-byte-aware decompression for the restore path.
+- New CLI flags: `--restore`, `--restore-file <path>`, `--report`.
+
+**Correctness fixes**
+- MySQL backup never set `MYSQL_PWD` → real MySQL backups were broken. Fixed.
+- Mongo reported `dbType` as `"mysql"`; MySQL's error path reported `"postgres"`. Both fixed.
+- `mkdirs()` return value is now checked before proceeding.
+
+**Compression heuristic fixed**
+- `estimateDbSize()` was hard-coded to 100 MB and the `> 500` / `< 100` thresholds left a gap, so the advisor *always* returned ZSTD. Each service now implements `estimateSizeBytes()` (`pg_database_size` / `information_schema` sum / Mongo `dbStats.dataSize`), and the tiers use inclusive boundaries so every size lands in exactly one branch (mock / query failure → balanced ZSTD default).
+- The size is captured **during** `testConnection` on the connection it already opens (cached per run), so the advisor reuses it instead of opening a second connection — one DB round-trip instead of two.
+
+**Robust Claude response parsing**
+- The old `indexOf("text") … lastIndexOf("\"")` approach captured trailing JSON (`stop_reason`, `usage`) on real API responses. Replaced with a single escape-aware extractor, `util/ClaudeResponse.extractText()`, now shared by `RootCauseAnalyser`, `NaturalLanguageParser`, and `RestoreAdvisor`.
+
+**Changeset:** 5 new files (`RestoreResult`, `RestoreAdvisor`, `BackupReportGenerator`, `ClaudeResponse`, `CompressionStreams`), 10 modified.
+
+> Implemented but not yet compiled/run (no JDK/Maven on PATH at the time) — build + smoke-test in IntelliJ before relying on it.
+
+**Still open after this session:** `KEY` → `ANTHROPIC_API_KEY` env-var mismatch in `AppConfig`; MongoDB password passed in argv + not URL-encoded; no HTTP timeouts on the two older AI callers; `--port` defaults to 5432 for all engines; a backup artifact is committed under `backups/`; no unit tests.

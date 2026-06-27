@@ -4,12 +4,18 @@ import com.backuputil.config.DbConfig;
 import com.backuputil.model.CompressionStrategy;
 import com.backuputil.service.DatabaseService;
 import com.backuputil.model.BackupResult;
+import com.backuputil.model.RestoreResult;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 
 public class MysqlService implements DatabaseService {
+
+    // Per-run cache: DB size captured during testConnection to avoid a second connection. null = unknown.
+    private Long cachedSizeBytes = null;
 
     @Override
     public boolean testConnection (DbConfig config){
@@ -24,6 +30,8 @@ public class MysqlService implements DatabaseService {
             try (Connection conn = DriverManager.getConnection(url, config.getUser(), config.getPassword())){
                 if (conn != null && !conn.isClosed()){
                     System.out.println ("Handshake successful! My SQL credentials are valid.");
+                    // Reuse this live connection to capture the DB size in the same round-trip.
+                    cachedSizeBytes = querySizeBytes(conn, config.getDbName());
                     return true;
                 }
             }
@@ -40,6 +48,43 @@ public class MysqlService implements DatabaseService {
             return true;
         }
         return false;
+    }
+
+    @Override
+    public long estimateSizeBytes(DbConfig config) {
+        // Captured during testConnection in the normal flow — return it without reconnecting.
+        if (cachedSizeBytes != null) return cachedSizeBytes;
+
+        if (config == null || config.isMock()) return -1;
+
+        // Fallback for callers that skipped testConnection. Short timeouts so a wrong host fails fast.
+        String url = String.format("jdbc:mysql://%s:%d/%s?connectTimeout=5000&socketTimeout=10000",
+                config.getHost(), config.getPort(), config.getDbName());
+
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+            try (Connection conn = DriverManager.getConnection(url, config.getUser(), config.getPassword())) {
+                cachedSizeBytes = querySizeBytes(conn, config.getDbName());
+                return cachedSizeBytes;
+            }
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    // Best-effort size query on an already-open connection. Returns -1 if it can't be read.
+    private long querySizeBytes(Connection conn, String dbName) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT COALESCE(SUM(data_length + index_length), 0) "
+                        + "FROM information_schema.tables WHERE table_schema = ?")) {
+            ps.setString(1, dbName);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getLong(1);
+            }
+        } catch (Exception e) {
+            // ignore — size is advisory only
+        }
+        return -1;
     }
 
     @Override
@@ -72,6 +117,8 @@ public class MysqlService implements DatabaseService {
         };
 
         ProcessBuilder pb = new ProcessBuilder(command);
+        // Pass the password via MYSQL_PWD env var (not a CLI arg) so it never appears in `ps aux`.
+        pb.environment().put("MYSQL_PWD", config.getPassword());
         long startTime = System.currentTimeMillis();
 
         // Explanation to the below code:
@@ -141,7 +188,7 @@ public class MysqlService implements DatabaseService {
             System.err.println("Core Engine Stream Failure: " + e.getMessage());
             return new BackupResult(
                     BackupResult.Status.FAILED,
-                    config.getDbName(), "postgres",
+                    config.getDbName(), "mysql",
                     outputPath.toAbsolutePath().toString(),
                     0, durationMs, -1, e.getMessage(),
                     java.time.Instant.now()
@@ -150,8 +197,88 @@ public class MysqlService implements DatabaseService {
     }
 
     @Override
-    public void restore (DbConfig config, String backupFilePath){
-        System.out.println("MySQL restore operation pending implementation...");
+    public RestoreResult restore(DbConfig config, String backupFilePath) {
+        long startTime = System.currentTimeMillis();
+        java.nio.file.Path source = java.nio.file.Paths.get(backupFilePath);
+
+        if (config == null || config.getPassword() == null) {
+            return new RestoreResult(RestoreResult.Status.ABORTED,
+                    config == null ? "?" : config.getDbName(), "mysql", backupFilePath,
+                    0, 0, -1, "Configuration or password missing", java.time.Instant.now());
+        }
+        if (!java.nio.file.Files.exists(source)) {
+            return new RestoreResult(RestoreResult.Status.ABORTED,
+                    config.getDbName(), "mysql", backupFilePath,
+                    0, 0, -1, "Backup file not found: " + backupFilePath, java.time.Instant.now());
+        }
+
+        CompressionStrategy strategy = CompressionStrategy.fromFileName(source.getFileName().toString());
+        System.out.println("Restoring mysql database '" + config.getDbName() + "' from " + source.toAbsolutePath());
+        System.out.println("Decompressing via " + strategy.name() + " and streaming into mysql client...");
+
+        // mysqldump produced a plain SQL script, so we replay it through the mysql client's stdin.
+        String[] command = {
+                "mysql",
+                "-h", config.getHost(),
+                "-P", String.valueOf(config.getPort()),
+                "-u", config.getUser(),
+                config.getDbName()
+        };
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        // Password via MYSQL_PWD env var — never on the command line.
+        pb.environment().put("MYSQL_PWD", config.getPassword());
+
+        try {
+            Process process = pb.start();
+
+            String[] stderrOutput = {""};
+            Thread stderrDrainer = Thread.ofVirtual().start(() -> {
+                try {
+                    stderrOutput[0] = new String(process.getErrorStream().readAllBytes(),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                } catch (Exception ignored) {
+                }
+            });
+            Thread stdoutDrainer = Thread.ofVirtual().start(() -> {
+                try {
+                    process.getInputStream().readAllBytes();
+                } catch (Exception ignored) {
+                }
+            });
+
+            long bytesRestored;
+            try (java.io.InputStream fileIn = java.nio.file.Files.newInputStream(source);
+                 java.io.InputStream decompressed = com.backuputil.util.CompressionStreams.wrapDecompress(fileIn, strategy);
+                 java.io.OutputStream toProcess = process.getOutputStream()) {
+
+                System.out.println("Replaying SQL into the live database...");
+                bytesRestored = decompressed.transferTo(toProcess);
+            }
+
+            int exitCode = process.waitFor();
+            stderrDrainer.join();
+            stdoutDrainer.join();
+            long durationMs = System.currentTimeMillis() - startTime;
+
+            if (exitCode == 0) {
+                System.out.println("MySQL restore pipeline completed successfully!");
+                return new RestoreResult(RestoreResult.Status.SUCCESS,
+                        config.getDbName(), "mysql", source.toAbsolutePath().toString(),
+                        bytesRestored, durationMs, exitCode, null, java.time.Instant.now());
+            } else {
+                System.err.println("Native mysql client failed with exit code (" + exitCode + "): " + stderrOutput[0]);
+                return new RestoreResult(RestoreResult.Status.FAILED,
+                        config.getDbName(), "mysql", source.toAbsolutePath().toString(),
+                        bytesRestored, durationMs, exitCode, stderrOutput[0], java.time.Instant.now());
+            }
+        } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - startTime;
+            System.err.println("Restore Engine Stream Failure: " + e.getMessage());
+            return new RestoreResult(RestoreResult.Status.FAILED,
+                    config.getDbName(), "mysql", source.toAbsolutePath().toString(),
+                    0, durationMs, -1, e.getMessage(), java.time.Instant.now());
+        }
     }
 
     private java.io.OutputStream buildCompressionStream(

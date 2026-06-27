@@ -58,4 +58,18 @@ public enum CompressionStrategy{
         return null;
     }
 
+    // Auto-detect the compression used by a backup file from its extension.
+    // Used by the restore pipeline to pick a decompressor. Defaults to GZIP
+    // (the backup-side fallback) when the extension is unrecognised.
+    public static CompressionStrategy fromFileName (String fileName){
+        if (fileName == null) return GZIP;
+        String lower = fileName.toLowerCase();
+        for (CompressionStrategy strategy : values()){
+            if (lower.endsWith(strategy.getExtension())){
+                return strategy;
+            }
+        }
+        return GZIP;
+    }
+
 }

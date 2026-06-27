@@ -2,6 +2,7 @@ package com.backuputil.ai;
 
 import com.backuputil.config.AppConfig;
 import com.backuputil.model.ParsedIntent;
+import com.backuputil.util.ClaudeResponse;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -103,16 +104,12 @@ public class NaturalLanguageParser {
             throw new RuntimeException("API returned status " + response.statusCode());
         }
 
-        return parseJsonResponse(extractTextBlock(response.body()));
-    }
-
-    private String extractTextBlock(String responseBody){
-        int contentIndex = responseBody.indexOf("\"text\":");
-        int start = responseBody.indexOf("\"", contentIndex + 7) + 1;
-        int end = responseBody.lastIndexOf("\"");
-        return responseBody.substring(start, end)
-                .replace("\\n", "")
-                .replace("\\\"", "\"");
+        // The model returns a JSON object as its text content; extract that block, then parse fields.
+        String jsonText = ClaudeResponse.extractText(response.body());
+        if (jsonText == null){
+            throw new RuntimeException("No text block found in API response");
+        }
+        return parseJsonResponse(jsonText);
     }
 
     private ParsedIntent parseJsonResponse (String json){

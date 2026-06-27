@@ -4,11 +4,15 @@ import com.backuputil.config.DbConfig;
 import com.backuputil.model.CompressionStrategy;
 import com.backuputil.service.DatabaseService;
 import com.backuputil.model.BackupResult;
+import com.backuputil.model.RestoreResult;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import org.bson.Document;
 
 public class MongoService implements DatabaseService {
+
+    // Per-run cache: DB size captured during testConnection to avoid a second connection. null = unknown.
+    private Long cachedSizeBytes = null;
 
     @Override
     public boolean testConnection(DbConfig config) {
@@ -22,6 +26,8 @@ public class MongoService implements DatabaseService {
             Document ping = mongoClient.getDatabase("admin").runCommand(new Document("ping", 1));
             if (ping.containsKey("ok") && ((Number) ping.get("ok")).doubleValue() == 1) {
                 System.out.println("Handshake successful! MongoDB cluster authentication is valid");
+                // Reuse this live client to capture the DB size in the same session.
+                cachedSizeBytes = querySizeBytes(mongoClient, config.getDbName());
                 return true;
             }
         } catch (Exception e) {
@@ -33,6 +39,41 @@ public class MongoService implements DatabaseService {
             return true;
         }
         return false;
+    }
+
+    @Override
+    public long estimateSizeBytes(DbConfig config) {
+        // Captured during testConnection in the normal flow — return it without reconnecting.
+        if (cachedSizeBytes != null) return cachedSizeBytes;
+
+        if (config == null || config.isMock()) return -1;
+
+        // Fallback for callers that skipped testConnection.
+        String connectionString = String.format(
+                "mongodb://%s:%s@%s:%d/%s?authSource=admin&serverSelectionTimeoutMS=5000",
+                config.getUser(), config.getPassword(), config.getHost(), config.getPort(), config.getDbName());
+
+        try (MongoClient mongoClient = MongoClients.create(connectionString)) {
+            cachedSizeBytes = querySizeBytes(mongoClient, config.getDbName());
+            return cachedSizeBytes;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    // Best-effort dbStats query on an already-open client. Returns -1 if it can't be read.
+    private long querySizeBytes(MongoClient mongoClient, String dbName) {
+        try {
+            Document stats = mongoClient.getDatabase(dbName).runCommand(new Document("dbStats", 1));
+            // dataSize is the uncompressed size of the documents — the best predictor of dump size.
+            Object dataSize = stats.get("dataSize");
+            if (dataSize instanceof Number number) {
+                return number.longValue();
+            }
+        } catch (Exception e) {
+            // ignore — size is advisory only
+        }
+        return -1;
     }
 
     @Override
@@ -105,7 +146,7 @@ public class MongoService implements DatabaseService {
                 System.out.println("MongoDB backup pipeline completed successfully!");
                 return new BackupResult(
                         BackupResult.Status.SUCCESS,
-                        config.getDbName(), "mysql",
+                        config.getDbName(), "mongo",
                         outputPath.toAbsolutePath().toString(),
                         outputPath.toFile().length(),
                         durationMs, exitCode, null,
@@ -115,7 +156,7 @@ public class MongoService implements DatabaseService {
                 System.err.println("Native mongodump failed with exit code (" + exitCode + "): " + stderrOutput[0]);
                 return new BackupResult(
                         BackupResult.Status.FAILED,
-                        config.getDbName(), "mysql",
+                        config.getDbName(), "mongo",
                         outputPath.toAbsolutePath().toString(),
                         0, durationMs, exitCode, stderrOutput[0],
                         java.time.Instant.now()
@@ -126,7 +167,7 @@ public class MongoService implements DatabaseService {
             System.err.println("MongoDB Core Engine Stream Failure: " + e.getMessage());
             return new BackupResult(
                     BackupResult.Status.FAILED,
-                    config.getDbName(), "mysql",
+                    config.getDbName(), "mongo",
                     outputPath.toAbsolutePath().toString(),
                     0, durationMs, -1, e.getMessage(),
                     java.time.Instant.now()
@@ -135,8 +176,88 @@ public class MongoService implements DatabaseService {
     }
 
     @Override
-    public void restore(DbConfig config, String backupFilePath) {
-        System.out.println("MongoDB restore operation pending implementation...");
+    public RestoreResult restore(DbConfig config, String backupFilePath) {
+        long startTime = System.currentTimeMillis();
+        java.nio.file.Path source = java.nio.file.Paths.get(backupFilePath);
+
+        if (config == null || config.getPassword() == null) {
+            return new RestoreResult(RestoreResult.Status.ABORTED,
+                    config == null ? "?" : config.getDbName(), "mongo", backupFilePath,
+                    0, 0, -1, "Configuration or password missing", java.time.Instant.now());
+        }
+        if (!java.nio.file.Files.exists(source)) {
+            return new RestoreResult(RestoreResult.Status.ABORTED,
+                    config.getDbName(), "mongo", backupFilePath,
+                    0, 0, -1, "Backup file not found: " + backupFilePath, java.time.Instant.now());
+        }
+
+        CompressionStrategy strategy = CompressionStrategy.fromFileName(source.getFileName().toString());
+        System.out.println("Restoring mongo database '" + config.getDbName() + "' from " + source.toAbsolutePath());
+        System.out.println("Decompressing via " + strategy.name() + " and streaming into mongorestore...");
+
+        // mongodump wrote a binary --archive to stdout; mongorestore --archive (no value) reads it from stdin.
+        String[] command = {
+                "mongorestore",
+                "--host", config.getHost(),
+                "--port", String.valueOf(config.getPort()),
+                "--username", config.getUser(),
+                "--password", config.getPassword(),
+                "--authenticationDatabase", "admin",
+                "--archive"
+        };
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+
+        try {
+            Process process = pb.start();
+
+            String[] stderrOutput = {""};
+            Thread stderrDrainer = Thread.ofVirtual().start(() -> {
+                try {
+                    stderrOutput[0] = new String(process.getErrorStream().readAllBytes(),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                } catch (Exception ignored) {
+                }
+            });
+            Thread stdoutDrainer = Thread.ofVirtual().start(() -> {
+                try {
+                    process.getInputStream().readAllBytes();
+                } catch (Exception ignored) {
+                }
+            });
+
+            long bytesRestored;
+            try (java.io.InputStream fileIn = java.nio.file.Files.newInputStream(source);
+                 java.io.InputStream decompressed = com.backuputil.util.CompressionStreams.wrapDecompress(fileIn, strategy);
+                 java.io.OutputStream toProcess = process.getOutputStream()) {
+
+                System.out.println("Streaming BSON archive into the live database...");
+                bytesRestored = decompressed.transferTo(toProcess);
+            }
+
+            int exitCode = process.waitFor();
+            stderrDrainer.join();
+            stdoutDrainer.join();
+            long durationMs = System.currentTimeMillis() - startTime;
+
+            if (exitCode == 0) {
+                System.out.println("MongoDB restore pipeline completed successfully!");
+                return new RestoreResult(RestoreResult.Status.SUCCESS,
+                        config.getDbName(), "mongo", source.toAbsolutePath().toString(),
+                        bytesRestored, durationMs, exitCode, null, java.time.Instant.now());
+            } else {
+                System.err.println("Native mongorestore failed with exit code (" + exitCode + "): " + stderrOutput[0]);
+                return new RestoreResult(RestoreResult.Status.FAILED,
+                        config.getDbName(), "mongo", source.toAbsolutePath().toString(),
+                        bytesRestored, durationMs, exitCode, stderrOutput[0], java.time.Instant.now());
+            }
+        } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - startTime;
+            System.err.println("MongoDB Restore Engine Stream Failure: " + e.getMessage());
+            return new RestoreResult(RestoreResult.Status.FAILED,
+                    config.getDbName(), "mongo", source.toAbsolutePath().toString(),
+                    0, durationMs, -1, e.getMessage(), java.time.Instant.now());
+        }
     }
 
     private java.io.OutputStream buildCompressionStream(
