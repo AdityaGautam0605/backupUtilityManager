@@ -37,3 +37,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### Project — never commit real database dumps or generated reports ###
+backups/
+*_report.txt

@@ -16,8 +16,10 @@ public class MongoService implements DatabaseService {
 
     @Override
     public boolean testConnection(DbConfig config) {
-        // constructing the mongodb connection
-        String connectionString = String.format("mongodb://%s:%s@%s:%d/%s?authSource=admin", config.getUser(), config.getPassword(), config.getHost(), config.getPort(), config.getDbName());
+        // constructing the mongodb connection. User/password are URL-encoded because a
+        // password containing @ : / ? # would otherwise corrupt the URI and misparse the host.
+        String connectionString = String.format("mongodb://%s:%s@%s:%d/%s?authSource=admin",
+                enc(config.getUser()), enc(config.getPassword()), config.getHost(), config.getPort(), config.getDbName());
         System.out.println("Testing MongoDB database connection");
 
         // using the official mongoDB sync driver to validate the cluster link
@@ -51,7 +53,7 @@ public class MongoService implements DatabaseService {
         // Fallback for callers that skipped testConnection.
         String connectionString = String.format(
                 "mongodb://%s:%s@%s:%d/%s?authSource=admin&serverSelectionTimeoutMS=5000",
-                config.getUser(), config.getPassword(), config.getHost(), config.getPort(), config.getDbName());
+                enc(config.getUser()), enc(config.getPassword()), config.getHost(), config.getPort(), config.getDbName());
 
         try (MongoClient mongoClient = MongoClients.create(connectionString)) {
             cachedSizeBytes = querySizeBytes(mongoClient, config.getDbName());
@@ -154,6 +156,7 @@ public class MongoService implements DatabaseService {
                 );
             } else {
                 System.err.println("Native mongodump failed with exit code (" + exitCode + "): " + stderrOutput[0]);
+                discardFailedArtifact(outputPath);
                 return new BackupResult(
                         BackupResult.Status.FAILED,
                         config.getDbName(), "mongo",
@@ -165,6 +168,7 @@ public class MongoService implements DatabaseService {
         } catch (Exception e) {
             long durationMs = System.currentTimeMillis() - startTime;
             System.err.println("MongoDB Core Engine Stream Failure: " + e.getMessage());
+            discardFailedArtifact(outputPath);
             return new BackupResult(
                     BackupResult.Status.FAILED,
                     config.getDbName(), "mongo",
@@ -257,6 +261,24 @@ public class MongoService implements DatabaseService {
             return new RestoreResult(RestoreResult.Status.FAILED,
                     config.getDbName(), "mongo", source.toAbsolutePath().toString(),
                     0, durationMs, -1, e.getMessage(), java.time.Instant.now());
+        }
+    }
+
+    // URL-encode a userinfo component so special characters survive inside the mongodb:// URI.
+    private static String enc(String s) {
+        return java.net.URLEncoder.encode(s == null ? "" : s, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    // A failed backup must not leave a partial/empty archive on disk — it would pollute the
+    // trends report and the restore picker, and could be mistaken for a good backup.
+    private void discardFailedArtifact(java.nio.file.Path outputPath) {
+        try {
+            if (java.nio.file.Files.deleteIfExists(outputPath)) {
+                System.err.println("Cleaned up incomplete archive: " + outputPath.toAbsolutePath());
+            }
+        } catch (Exception e) {
+            System.err.println("Note: could not remove incomplete archive "
+                    + outputPath.toAbsolutePath() + ": " + e.getMessage());
         }
     }
 

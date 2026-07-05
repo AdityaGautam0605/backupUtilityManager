@@ -20,8 +20,10 @@ public class NaturalLanguageParser {
 
     public NaturalLanguageParser() {
         this.config = AppConfig.getInstance();
-        this.httpClient = HttpClient.newHttpClient();
-
+        // Connect timeout so a hung/unreachable API can't freeze the whole CLI.
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(15))
+                .build();
     }
 
     public ParsedIntent parse (String input){
@@ -92,6 +94,7 @@ public class NaturalLanguageParser {
                 """, MODEL, escapeJson(systemInstruction));
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(ANTHROPIC_API_URL))
+                .timeout(java.time.Duration.ofSeconds(30))
                 .header("Content-Type", "application/json")
                 .header("x-api-key", config.getAnthropicApiKey())
                 .header("anthropic-version", "2023-06-01")
@@ -137,8 +140,6 @@ public class NaturalLanguageParser {
         return null;
     }
     private String escapeJson(String text) {
-        return text.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n");
+        return com.backuputil.util.JsonStrings.escape(text);
     }
 }

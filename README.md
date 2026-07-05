@@ -123,12 +123,22 @@ Design already discussed and ready to implement when ready:
 - New files planned: `security/EncryptionService.java`, `security/EncryptionResult.java`
 - Zero new dependencies needed — uses JDK's built-in `javax.crypto`
 
-### Known Outstanding Issues
-- `Main.java` still sits in `org.example` package — should be moved to `com.backuputil` for consistency
-- Password masking in terminal input — currently picocli's `interactive=true` echoes the password in plaintext in some terminal contexts (e.g. IntelliJ Run window). A more robust fix using `System.console().readPassword()` was designed but deliberately skipped for now as a low-priority cosmetic issue
-- BZIP2/LZ4/ZSTD Maven dependencies need correct group IDs verified before compression actually uses anything other than GZIP fallback (current `pom.xml` entries had incorrect coordinates for LZ4 — needs fixing: likely `net.jpountz.lz4:lz4:1.3.0` rather than `org.lz4:lz4-java`). Until then, every archive is GZIP regardless of the `.zst`/`.bz2`/`.lz4` extension chosen — restore handles this via magic-byte detection
-- No unit tests yet anywhere in the project
-- MongoDB still passes `--password` as a process argument (visible in `ps aux`) on both backup and restore — unlike Postgres/MySQL which use env vars. mongodump/mongorestore have no password env var, so this needs a different approach (e.g. `--config` file or stdin)
+### Correctness pass (2026-07-05)
+Made the code match what this README claims. All pending a first clean build in IntelliJ:
+- **AI now actually enables.** `AppConfig` read the env var `KEY` while every message said `ANTHROPIC_API_KEY`; it now reads `ANTHROPIC_API_KEY`.
+- **Compression is real, not cosmetic.** Added the correct dependencies (`org.apache.commons:commons-compress`, `org.lz4:lz4-java:1.8.0`, `com.github.luben:zstd-jni`) so BZIP2/LZ4/ZSTD load instead of silently falling back to GZIP. `CompressionStrategy.isAvailable()` now probes the classpath for the backing library (what's actually used) rather than running `which`/`where` on a CLI binary that is never invoked.
+- **Per-engine default ports.** `--port` now defaults to 5432/3306/27017 based on the resolved DB type instead of a hardcoded 5432 for everything.
+- **HTTP timeouts** added to `RootCauseAnalyser` and `NaturalLanguageParser` (they could previously hang the CLI forever).
+- **Robust JSON escaping.** All three AI callers now share `util/JsonStrings.escape()`, which escapes every control character (not just `\n`/`\"`), so odd bytes in tool stderr can't produce a malformed request body.
+- **MongoDB credentials URL-encoded** in the connection string so a password containing `@ : / ? #` no longer corrupts the URI.
+- **Backups no longer committed to git** — `backups/` and `*_report.txt` are gitignored.
+- **Unit tests** added for the pure functions (`ClaudeResponse`, `JsonStrings`, `CompressionStrategy`).
+
+### Still Outstanding
+- `Main.java` still sits in `org.example` package — should be moved to `com.backuputil` for consistency (left for an IDE refactor so the run configuration updates with it).
+- Password masking in terminal input — picocli's `interactive=true` echoes the password in plaintext in some terminal contexts (e.g. IntelliJ Run window). A more robust fix using `System.console().readPassword()` was designed but deliberately skipped as a low-priority cosmetic issue.
+- MongoDB still passes `--password` as a process argument (visible in `ps aux`) on both backup and restore — unlike Postgres/MySQL which use env vars. mongodump/mongorestore have no password env var, so this needs a different approach (e.g. `--config` file). The connection string used for the JDBC-style handshake is now URL-encoded, but the argv exposure to the native tools remains.
+- Postgres restore replays a plain SQL script without `--clean`/`--if-exists`, so it targets an empty database cleanly but errors on pre-existing objects.
 
 ---
 

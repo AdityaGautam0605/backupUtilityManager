@@ -18,7 +18,10 @@ public class RootCauseAnalyser {
 
     public RootCauseAnalyser(){
         this.config = AppConfig.getInstance();
-        this.httpClient = HttpClient.newHttpClient();
+        // Connect timeout so a hung/unreachable API can't freeze the whole CLI.
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(15))
+                .build();
     }
 
     public String analyse(BackupResult result){
@@ -76,6 +79,7 @@ public class RootCauseAnalyser {
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(ANTHROPIC_API_URL))
+                    .timeout(java.time.Duration.ofSeconds(30))
                     .header("Content-Type", "application/json")
                     .header("x-api-key", config.getAnthropicApiKey())
                     .header("anthropic-version", "2023-06-01")
@@ -140,13 +144,9 @@ public class RootCauseAnalyser {
         return text != null ? text : "[AI] Could not parse response";
     }
 
-    // escape special characters for JSON string embedding
+    // escape special characters for JSON string embedding (handles all control chars)
     private String escapeJson(String text){
-        return text.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+        return com.backuputil.util.JsonStrings.escape(text);
     }
 
     private String formatSize (long bytes){

@@ -1,7 +1,7 @@
 package com.backuputil.config;
 
 public class AppConfig {
-    private static final String AI_KEY_ENV = "KEY";
+    private static final String AI_KEY_ENV = "ANTHROPIC_API_KEY";
     private static final String MOCK_AI_ENV = "MOCK_AI";
 
     private final String aiApiKey;

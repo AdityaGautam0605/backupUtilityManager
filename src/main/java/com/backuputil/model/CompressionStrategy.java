@@ -1,7 +1,5 @@
 package com.backuputil.model;
 
-import java.util.concurrent.TimeUnit;
-
 public enum CompressionStrategy{
     GZIP("gzip", ".gz", "Best compatibility, decent compression, always available"),
     BZIP2("bzip2", ".bz2", "Better compression than GZIP, slower — good for infrequent small backups"),
@@ -22,27 +20,25 @@ public enum CompressionStrategy{
     public String getExtension() { return extension; }
     public String getDescription() { return description; }
 
-    // use 'which' on UNIX/ 'where' on WINDOWS -more reliable than --version
+    // Availability = "can we actually build this stream at runtime?". Compression is done
+    // through Java libraries (loaded reflectively in the services), NOT the system CLI, so we
+    // probe the classpath for the backing class rather than running `which`/`where`. GZIP is
+    // always available because it ships with the JDK.
     public boolean isAvailable(){
-        // GZIP is always available - it's part of JAVA'S standard library.
         if (this == GZIP) return true;
 
+        String backingClass = switch (this){
+            case BZIP2 -> "org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream";
+            case LZ4   -> "net.jpountz.lz4.LZ4FrameOutputStream";
+            case ZSTD  -> "com.github.luben.zstd.ZstdOutputStream";
+            default    -> null;
+        };
+        if (backingClass == null) return false;
+
         try {
-            String checker = System.getProperty("os.name").toLowerCase().contains("win") ?
-                    "where" : "which";
-
-            Process process = new ProcessBuilder (checker, command)
-                    .redirectErrorStream(true).start();
-
-            // timeout prevents hanging on slow systems;
-            boolean finished = process.waitFor(3, TimeUnit.SECONDS);
-            if (!finished){
-                process.destroyForcibly();
-                return false;
-            }
-
-            return process.exitValue () == 0;
-        } catch (Exception e){
+            Class.forName(backingClass);
+            return true;
+        } catch (ClassNotFoundException e){
             return false;
         }
     }

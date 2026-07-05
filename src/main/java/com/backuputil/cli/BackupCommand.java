@@ -34,8 +34,10 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"-H", "--host"}, description = "Database host address", defaultValue = "localhost")
     private String host;
 
-    @Option(names = {"-p", "--port"}, description = "Database port", defaultValue = "5432")
-    private int port;
+    // Nullable so we can tell "user didn't specify" from "user typed 5432" and pick the right
+    // engine default (postgres 5432 / mysql 3306 / mongo 27017) once the DB type is known.
+    @Option(names = {"-p", "--port"}, description = "Database port (default per engine: postgres 5432, mysql 3306, mongo 27017)")
+    private Integer port;
 
     @Option(names = {"-u", "--user"}, description = "Database username")
     private String user;
@@ -81,6 +83,11 @@ public class BackupCommand implements Callable<Integer> {
         if (dbName == null || dbName.isBlank()) {
             dbName = promptForValue("Enter target database name: ");
         }
+        // Resolve the port default now that the engine is known (NL parsing / prompts have run).
+        if (port == null) {
+            port = defaultPortForEngine(dbType);
+        }
+
         RootCauseAnalyser analyser = new RootCauseAnalyser();
         System.out.println ("Initializing workflow verification...");
 
@@ -112,6 +119,12 @@ public class BackupCommand implements Callable<Integer> {
         if ("mysql".equalsIgnoreCase(type))    return new MysqlService();
         if ("mongo".equalsIgnoreCase(type))     return new MongoService();
         return null;
+    }
+
+    private int defaultPortForEngine(String type){
+        if ("mysql".equalsIgnoreCase(type)) return 3306;
+        if ("mongo".equalsIgnoreCase(type)) return 27017;
+        return 5432; // postgres / fallback
     }
 
     private int runBackup(DatabaseService dbService, DbConfig config, RootCauseAnalyser analyser){

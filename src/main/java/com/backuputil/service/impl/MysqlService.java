@@ -174,6 +174,7 @@ public class MysqlService implements DatabaseService {
                 );
             } else {
                 System.err.println("Native mysqldump failed with exit code (" + exitCode + "): " + stderrOutput[0]);
+                discardFailedArtifact(outputPath);
                 return new BackupResult(
                         BackupResult.Status.FAILED,
                         config.getDbName(), "mysql",
@@ -186,6 +187,7 @@ public class MysqlService implements DatabaseService {
         } catch (Exception e) {
             long durationMs = System.currentTimeMillis() - startTime;
             System.err.println("Core Engine Stream Failure: " + e.getMessage());
+            discardFailedArtifact(outputPath);
             return new BackupResult(
                     BackupResult.Status.FAILED,
                     config.getDbName(), "mysql",
@@ -278,6 +280,19 @@ public class MysqlService implements DatabaseService {
             return new RestoreResult(RestoreResult.Status.FAILED,
                     config.getDbName(), "mysql", source.toAbsolutePath().toString(),
                     0, durationMs, -1, e.getMessage(), java.time.Instant.now());
+        }
+    }
+
+    // A failed backup must not leave a partial/empty archive on disk — it would pollute the
+    // trends report and the restore picker, and could be mistaken for a good backup.
+    private void discardFailedArtifact(java.nio.file.Path outputPath) {
+        try {
+            if (java.nio.file.Files.deleteIfExists(outputPath)) {
+                System.err.println("Cleaned up incomplete archive: " + outputPath.toAbsolutePath());
+            }
+        } catch (Exception e) {
+            System.err.println("Note: could not remove incomplete archive "
+                    + outputPath.toAbsolutePath() + ": " + e.getMessage());
         }
     }
 
