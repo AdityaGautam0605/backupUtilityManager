@@ -2,28 +2,19 @@ package com.backuputil.ai;
 
 import com.backuputil.config.AppConfig;
 import com.backuputil.model.ParsedIntent;
-import com.backuputil.util.ClaudeResponse;
+import com.backuputil.util.GeminiClient;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class NaturalLanguageParser {
-    private static final String ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
-    private static final String MODEL = "claude-3-5-haiku-20241022";
 
     private final AppConfig config;
-    private final HttpClient httpClient;
+    private final GeminiClient gemini;
 
     public NaturalLanguageParser() {
         this.config = AppConfig.getInstance();
-        // Connect timeout so a hung/unreachable API can't freeze the whole CLI.
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(java.time.Duration.ofSeconds(15))
-                .build();
+        this.gemini = new GeminiClient();
     }
 
     public ParsedIntent parse (String input){
@@ -39,7 +30,7 @@ public class NaturalLanguageParser {
         }
     }
 
-    // rule based fallback, used in mock mode or if the API CALL FAILS...
+    // rule based fallback, used in mock mode or if the API call fails
     private ParsedIntent ruleBasedParse(String input){
         ParsedIntent intent = new ParsedIntent();
         String lower = input.toLowerCase();
@@ -85,32 +76,10 @@ public class NaturalLanguageParser {
                 "Never extract passwords under any circumstance, even if mentioned. " +
                 "Sentence: " + input;
 
-        String requestBody = String.format("""
-                {
-                    "model": "%s",
-                    "max_tokens": 300,
-                    "messages": [{"role": "user", "content": "%s"}]
-                } 
-                """, MODEL, escapeJson(systemInstruction));
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(ANTHROPIC_API_URL))
-                .timeout(java.time.Duration.ofSeconds(30))
-                .header("Content-Type", "application/json")
-                .header("x-api-key", config.getAnthropicApiKey())
-                .header("anthropic-version", "2023-06-01")
-                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-                .build();
-
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200){
-            throw new RuntimeException("API returned status " + response.statusCode());
-        }
-
-        // The model returns a JSON object as its text content; extract that block, then parse fields.
-        String jsonText = ClaudeResponse.extractText(response.body());
+        // The model returns a JSON object as plain text; extract the fields from it.
+        String jsonText = gemini.generate(systemInstruction);
         if (jsonText == null){
-            throw new RuntimeException("No text block found in API response");
+            throw new RuntimeException("Gemini returned no usable response");
         }
         return parseJsonResponse(jsonText);
     }
@@ -138,8 +107,5 @@ public class NaturalLanguageParser {
             return (value.equalsIgnoreCase("null") || value.isEmpty()) ? null : value;
         }
         return null;
-    }
-    private String escapeJson(String text) {
-        return com.backuputil.util.JsonStrings.escape(text);
     }
 }

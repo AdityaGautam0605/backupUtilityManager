@@ -1,28 +1,29 @@
 package com.backuputil.util;
 
 /**
- * Minimal, dependency-free reader for Anthropic Messages API responses.
+ * Minimal, dependency-free extractor for the first JSON {@code "text"} value in an LLM
+ * response body.
  *
- * The response shape is:
- * <pre>
- * { ..., "content":[{"type":"text","text":"the answer"}], "stop_reason":"end_turn", "usage":{...} }
- * </pre>
+ * Works for both response shapes this project has used:
+ * <ul>
+ *   <li>Anthropic: {@code {"content":[{"type":"text","text":"..."}], ...}}</li>
+ *   <li>Google Gemini: {@code {"candidates":[{"content":{"parts":[{"text":"..."}]}}], ...}}</li>
+ * </ul>
+ * In both, the model's output is the first {@code "text":} field in the payload.
  *
- * Earlier code located the text value with {@code indexOf("\"text\":")} and then
- * {@code lastIndexOf("\"")} — but because real responses carry fields *after* the
- * text block, that grabbed everything up to the last quote in {@code usage}/{@code stop_reason}.
- * This walks the string value properly, honouring JSON escape sequences and stopping
- * at the first unescaped closing quote.
+ * Walks the string value honouring JSON escape sequences and stops at the first unescaped
+ * closing quote — a naive {@code lastIndexOf('"')} would over-capture trailing metadata
+ * ({@code usageMetadata}, {@code finishReason}, {@code stop_reason}, ...).
  */
-public final class ClaudeResponse {
+public final class LlmResponse {
 
     private static final String TEXT_KEY = "\"text\":";
 
-    private ClaudeResponse() {
+    private LlmResponse() {
     }
 
     /**
-     * Extracts the first {@code "text"} content block, or {@code null} if none is present.
+     * Extracts the first {@code "text"} value, or {@code null} if none is present.
      */
     public static String extractText(String responseBody) {
         if (responseBody == null) return null;

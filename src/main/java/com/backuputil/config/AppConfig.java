@@ -1,7 +1,7 @@
 package com.backuputil.config;
 
 public class AppConfig {
-    private static final String AI_KEY_ENV = "ANTHROPIC_API_KEY";
+    private static final String AI_KEY_ENV = "GEMINI_API_KEY";
     private static final String MOCK_AI_ENV = "MOCK_AI";
 
     private final String aiApiKey;
@@ -16,7 +16,7 @@ public class AppConfig {
     private static final AppConfig INSTANCE  = new AppConfig();
     public static AppConfig getInstance() {return INSTANCE;}
 
-    public String getAnthropicApiKey(){return aiApiKey;}
+    public String getApiKey(){return aiApiKey;}
     public boolean isMockAi(){return mockAi;}
 
     public boolean isAiEnabled(){
@@ -27,9 +27,9 @@ public class AppConfig {
         if (mockAi) {
             System.out.println("[AI] Mock mode active — no API calls will be made");
         } else if (isAiEnabled()) {
-            System.out.println("[AI] Anthropic API key loaded successfully");
+            System.out.println("[AI] Gemini API key loaded successfully");
         } else {
-            System.out.println("[AI] No API key found — AI features disabled. Set ANTHROPIC_API_KEY to enable.");
+            System.out.println("[AI] No API key found — AI features disabled. Set GEMINI_API_KEY to enable.");
         }
 
     }

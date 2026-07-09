@@ -5,18 +5,13 @@ import com.backuputil.config.DbConfig;
 import com.backuputil.model.CompressionStrategy;
 import com.backuputil.model.RestoreResult;
 import com.backuputil.service.DatabaseService;
-import com.backuputil.util.ClaudeResponse;
+import com.backuputil.util.GeminiClient;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -31,15 +26,12 @@ import java.util.regex.Pattern;
  *    filenames) and lets the user pick which snapshot to restore.
  *  - Decompression strategy auto-detection from the file extension.
  *  - A destructive-operation confirmation gate (restore overwrites live data).
- *  - AI guidance: a short safety briefing (rule-based in mock mode, Claude in real mode).
+ *  - AI guidance: a short safety briefing (rule-based in mock mode, Gemini in real mode).
  *
  * The advisor does not pick the service implementation — {@code BackupCommand} already
  * resolves the DB type and hands the matching {@link DatabaseService} in.
  */
 public class RestoreAdvisor {
-
-    private static final String ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
-    private static final String MODEL = "claude-3-5-haiku-20241022";
 
     // Matches "<dbName>_<yyyyMMdd>_<HHmmss>_backup.<ext...>" — group 1 is the db name
     // (which may itself contain underscores), groups 2/3 are the timestamp.
@@ -48,14 +40,12 @@ public class RestoreAdvisor {
 
     private final AppConfig config;
     private final BufferedReader inputReader;
-    private final HttpClient httpClient;
+    private final GeminiClient gemini;
 
     public RestoreAdvisor() {
         this.config = AppConfig.getInstance();
         this.inputReader = new BufferedReader(new InputStreamReader(System.in));
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(15))
-                .build();
+        this.gemini = new GeminiClient();
     }
 
     /**
@@ -177,38 +167,14 @@ public class RestoreAdvisor {
     }
 
     private String aiGuidance(DbConfig dbConfig, String dbType, String file, CompressionStrategy strategy) {
-        try {
-            String prompt = String.format(
-                    "I am about to restore a %s database named '%s' from the backup file '%s' "
-                            + "(compressed with %s). In 2-3 concise sentences, give a safety checklist "
-                            + "and the main risks. Do not ask for the password.",
-                    dbType, dbConfig.getDbName(), new File(file).getName(), strategy.name());
+        String prompt = String.format(
+                "I am about to restore a %s database named '%s' from the backup file '%s' "
+                        + "(compressed with %s). In 2-3 concise sentences, give a safety checklist "
+                        + "and the main risks. Do not ask for the password.",
+                dbType, dbConfig.getDbName(), new File(file).getName(), strategy.name());
 
-            String requestBody = String.format("""
-                    {
-                        "model": "%s",
-                        "max_tokens": 300,
-                        "messages": [{"role": "user", "content": "%s"}]
-                    }
-                    """, MODEL, escapeJson(prompt));
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(ANTHROPIC_API_URL))
-                    .timeout(Duration.ofSeconds(30))
-                    .header("Content-Type", "application/json")
-                    .header("x-api-key", config.getAnthropicApiKey())
-                    .header("anthropic-version", "2023-06-01")
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() != 200) {
-                return null; // fall back to rule-based
-            }
-            return ClaudeResponse.extractText(response.body());
-        } catch (Exception e) {
-            return null; // fall back to rule-based
-        }
+        // Returns null on any failure, so guidance() falls back to the rule-based briefing.
+        return gemini.generate(prompt);
     }
 
     // ---- helpers -----------------------------------------------------------------
@@ -243,9 +209,5 @@ public class RestoreAdvisor {
         if (bytes < 1024) return bytes + " B";
         if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
         return String.format("%.1f MB", bytes / (1024.0 * 1024));
-    }
-
-    private String escapeJson(String text) {
-        return com.backuputil.util.JsonStrings.escape(text);
     }
 }

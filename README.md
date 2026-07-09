@@ -1,193 +1,208 @@
 # Database Backup Utility CLI
 
-A Java CLI tool for backing up PostgreSQL, MySQL, and MongoDB databases — with an AI layer for root cause analysis, compression strategy advice, and natural language input parsing.
+A Java command-line tool for backing up and restoring **PostgreSQL, MySQL, and MongoDB**
+databases — with streaming compression, an AI assistance layer, point-in-time restore, and
+clean structured reporting.
+
+![Java](https://img.shields.io/badge/Java-21-orange)
+![Build](https://img.shields.io/badge/build-Maven-blue)
+![Databases](https://img.shields.io/badge/databases-PostgreSQL%20·%20MySQL%20·%20MongoDB-informational)
 
 ---
 
-## Current Architecture
+## Features
+
+- **Backup & restore** across PostgreSQL, MySQL, and MongoDB by driving the native client
+  tools (`pg_dump` / `mysqldump` / `mongodump` and `psql` / `mysql` / `mongorestore`).
+- **Streaming compression** — data is piped straight from the dump process through the
+  compressor to disk, so even a large database is handled in **constant memory**. Pick GZIP,
+  ZSTD, LZ4, or BZIP2.
+- **AI assistance (Google Gemini, free tier)** with a built-in offline **mock mode** — no
+  API key or network needed to try it:
+  - **Root-cause analysis** of every run, success or failure.
+  - **Compression advisor** that reads the real database size and recommends a strategy.
+  - **Natural-language input** — describe the job in plain English instead of memorising flags.
+  - **Restore guidance** — a short safety briefing before you overwrite live data.
+- **Point-in-time restore** — choose a snapshot from an interactive list or restore a specific
+  file; the compression format is auto-detected from the archive (with a magic-byte safety net).
+- **Post-backup reports** with a trends section: archive-size history, delta vs. the previous
+  run, growth/shrink warnings, and pruning hints.
+
+---
+
+## Architecture
 
 ```
 com.backuputil/
-├── ai/
-│   ├── RootCauseAnalyser.java      — AI-powered failure/success analysis
-│   ├── CompressionAdvisor.java     — recommends + confirms compression strategy
-│   ├── NaturalLanguageParser.java  — parses plain English into backup config
-│   ├── RestoreAdvisor.java         — AI-guided interactive restore (point-in-time + decompression detection)
-│   └── BackupReportGenerator.java  — human-readable post-backup report with trends
 ├── cli/
-│   └── BackupCommand.java          — picocli entrypoint, wires everything together
+│   └── BackupCommand.java        — picocli entry point, orchestrates the workflow
 ├── config/
-│   ├── AppConfig.java              — API key + mock mode singleton
-│   └── DbConfig.java               — immutable DB connection config
+│   ├── AppConfig.java            — API key + mock-mode singleton
+│   └── DbConfig.java             — immutable DB connection config
 ├── model/
-│   ├── BackupResult.java           — structured result of a backup run
-│   ├── RestoreResult.java          — structured result of a restore run
-│   ├── CompressionStrategy.java    — enum: GZIP, BZIP2, LZ4, ZSTD (+ extension auto-detect)
-│   └── ParsedIntent.java           — output of natural language parsing
-├── util/
-│   └── CompressionStreams.java     — decompression helpers (magic-byte aware) for restore
-└── service/
-    ├── DatabaseService.java        — interface
-    └── impl/
-        ├── PostgresService.java
-        ├── MysqlService.java
-        └── MongoService.java
+│   ├── BackupResult.java         — structured result of a backup run
+│   ├── RestoreResult.java        — structured result of a restore run
+│   ├── CompressionStrategy.java  — enum GZIP/BZIP2/LZ4/ZSTD + extension auto-detect
+│   └── ParsedIntent.java         — output of natural-language parsing
+├── service/
+│   ├── DatabaseService.java      — engine interface
+│   └── impl/
+│       ├── PostgresService.java
+│       ├── MysqlService.java
+│       └── MongoService.java
+├── ai/
+│   ├── RootCauseAnalyser.java    — failure/success analysis
+│   ├── CompressionAdvisor.java   — recommends + confirms a compression strategy
+│   ├── NaturalLanguageParser.java— plain English → backup config
+│   ├── RestoreAdvisor.java       — interactive point-in-time restore + guidance
+│   └── BackupReportGenerator.java— human-readable report with trends
+└── util/
+    ├── GeminiClient.java         — single Gemini API client, shared by the ai/ classes
+    ├── LlmResponse.java          — dependency-free response-text extractor
+    ├── JsonStrings.java          — RFC-8259 JSON string escaping
+    └── CompressionStreams.java   — magic-byte-aware decompression for restore
 
-org.example/  (legacy package — Main.java still lives here, should be moved to com.backuputil)
-└── Main.java
+org.example/
+└── Main.java                     — bootstraps the picocli command
 ```
 
 ---
 
-## What's Done
+## Design highlights
 
-### Core Fixes
-- Fixed stderr deadlock — backup/restore no longer hangs on large databases (background thread drains stderr concurrently with stdout)
-- Fixed MySQL password exposure — password now passed via `MYSQL_PWD` env var instead of CLI arg (no longer visible in `ps aux`)
-- Fixed `--mock` flag — no longer required on every run, defaults to `false`, all three services gate their test bypasses behind `config.isMock()` consistently
-- Fixed package structure — `DatabaseService` interface moved from `service.impl` to `service`
-- Introduced `BackupResult` — structured return type (status, db name/type, file size, duration, exit code, error message, timestamp) instead of swallowed print statements
-
-### Phase 1 — Core AI Layer
-- `AppConfig` singleton reads `ANTHROPIC_API_KEY` and `MOCK_AI` from environment variables
-- `RootCauseAnalyser` analyses both successful and failed backups
-    - Mock mode: rule-based canned analysis (no API calls, free to test)
-    - Real mode: calls Claude API (`claude-3-5-haiku`) via raw `HttpClient`, no SDK dependency
-- Wired into `BackupCommand` — analysis prints after every backup run
-
-### Phase 2 — Compression Intelligence
-- `CompressionStrategy` enum (GZIP, BZIP2, LZ4, ZSTD) with availability detection via `which`/`where` (3s timeout, GZIP always available since it's JDK-native)
-- `CompressionAdvisor` recommends a strategy based on estimated DB size + backup frequency, shows reasoning, lets user accept or override, falls back to GZIP if the chosen algorithm isn't installed
-- All three services updated to use `strategy.getExtension()` for filenames and `buildCompressionStream()` for actual compression (reflection-based — falls back to GZIP gracefully if BZIP2/LZ4/ZSTD libraries aren't on the classpath yet)
-- `--backup-frequency` CLI flag added
-
-### Phase 3 — Natural Language CLI
-- `--nl "<sentence>"` flag lets users describe what they want in plain English instead of remembering flags
-- `NaturalLanguageParser`:
-    - Mock mode: regex-based extraction (dbType, host, port, user, dbName, mock flag)
-    - Real mode: Claude API call with strict JSON-only system prompt
-    - **Passwords are never extracted from natural language, by design** — always prompted separately
-- Missing required fields (`-t`, `-u`, `-d`) are now optional at the CLI level and get interactively prompted if still missing after NL parsing
-- Tested end-to-end with real Postgres connection attempts — works correctly
-
-### Phase 4 — Restore + Report
-- `restore()` is now implemented in all three services (was a stub). Each decompresses the archive and streams it into the native client:
-    - Postgres → `psql` stdin, password via `PGPASSWORD`
-    - MySQL → `mysql` client stdin, password via `MYSQL_PWD`
-    - Mongo → `mongorestore --archive` stdin
-    - Same background-virtual-thread draining used on backup, applied to both stdout and stderr to avoid the OS-buffer deadlock
-- `RestoreResult` — structured restore outcome (status, db, source, bytes restored, duration, exit code, error, timestamp)
-- `RestoreAdvisor` — AI-guided interactive restore:
-    - **Point-in-time selection**: lists existing backups for the database (timestamp + size parsed from filenames), user picks the snapshot
-    - **Decompression auto-detection** from the file extension, with a magic-byte safety net (a file labelled `.zst` that actually holds GZIP bytes — the current backup fallback reality — is still read correctly)
-    - **Destructive-operation confirmation gate** before touching the live database
-    - **AI guidance**: rule-based safety briefing in mock mode, Claude in real mode (graceful fallback)
-- `BackupReportGenerator` — human-readable post-backup report:
-    - Summary (status, size, duration, throughput, exit code) plus a **Trends** section derived by scanning prior backups on disk (count, total size, delta vs previous run) and **recommendations** (growth spikes, 0-byte archives, pruning suggestions)
-    - Printed after every backup; `--report` also writes it to `<db>_<timestamp>_report.txt`
-- New CLI flags: `--restore` (interactive picker), `--restore-file <path>` (direct), `--report`
-- `util/CompressionStreams` — centralised, magic-byte-aware decompression for the restore path
-- **Correctness fixes made alongside this phase:** MySQL backup now actually passes the password (`MYSQL_PWD` was never set — real MySQL backups were broken); MySQL error-path and Mongo result objects now report the correct `dbType` (were hard-coded to the wrong engine)
-
-### Follow-up fixes (compression heuristic + JSON parsing)
-- **Compression advisor now uses the real database size.** `estimateDbSize()` was hard-coded to 100 MB, and with the old `> 500` / `< 100` thresholds the recommendation *always* came out ZSTD. Each service now implements `estimateSizeBytes()` (`pg_database_size` / `information_schema` sum / Mongo `dbStats.dataSize`), the advisor feeds that real number in, and the thresholds use inclusive boundaries so every size lands in exactly one tier (mock mode / query failure → balanced ZSTD default).
-  - The size is captured **during** `testConnection` on the connection it already opens (cached per run), so the advisor reuses it instead of opening a second connection. `estimateSizeBytes()` keeps a standalone fallback for callers that skip the connection test.
-- **Robust Claude response parsing.** The old `indexOf("text") … lastIndexOf("\"")` approach captured trailing JSON (`stop_reason`, `usage`) on real API responses. Replaced with a single escape-aware extractor, `util/ClaudeResponse.extractText()`, now used by `RootCauseAnalyser`, `NaturalLanguageParser`, and `RestoreAdvisor`.
-
-> Note: implemented but not yet compiled/run on this machine (no JDK/Maven on PATH) — build + smoke-test in IntelliJ before relying on it.
+- **Deadlock-free process I/O.** A child process's `stdout` and `stderr` are drained
+  concurrently on virtual threads, so a chatty `pg_dump` can't fill a fixed-size OS pipe
+  buffer and hang the pipeline — the classic `Runtime.exec()` trap.
+- **Constant-memory streaming.** `InputStream.transferTo` pumps the dump straight into the
+  compressor and out to disk; the full archive is never held in RAM.
+- **Credentials never on the command line.** Passwords are passed via the `PGPASSWORD` /
+  `MYSQL_PWD` environment variables rather than process arguments, so they don't appear in the
+  process list. The MongoDB connection string is URL-encoded so special characters in a
+  password can't corrupt the URI.
+- **Real, pluggable compression.** GZIP (JDK-native) plus ZSTD, LZ4, and BZIP2 via libraries,
+  chosen by an advisor that queries the actual database size and backup frequency.
+- **Safe restores.** The decompressor is selected from the file extension and confirmed by the
+  archive's magic bytes; a destructive-operation gate requires explicit confirmation before any
+  write to a live database.
+- **Honest failure semantics.** Every run returns a structured result (status, size, duration,
+  exit code, error message); a failed backup deletes its own incomplete archive instead of
+  leaving a corrupt file behind.
 
 ---
 
-## What's Pending
+## Getting started
 
-### Phase 5 — Cloud Upload (not started, deferred — cost)
-- `CloudUploader` interface only for now
-- Target implementation: AWS S3 (most generous free tier — 5GB/12 months)
-- Planned structure:
-  ```
-  service/cloud/
-  ├── CloudUploader.java       (interface)
-  └── impl/
-      └── S3Uploader.java
-  ```
-- AI-assisted storage tier decisions (e.g. backups older than 30 days → cold storage) — design only, not implemented
+### Prerequisites
 
-### Encryption + Security Layer (designed, not implemented — deferred)
-**Reason for deferral:** waiting until comfortable with FastAPI, encryption fundamentals, and authentication concepts before implementing, so the code is fully understood rather than copy-pasted.
+- **JDK 21+** (the tool uses virtual threads).
+- **Maven** — IntelliJ IDEA bundles both a JDK and Maven, so no separate install is needed there.
+- The **native client tools** for the databases you use, available on your `PATH`:
+  - PostgreSQL → `pg_dump`, `psql`
+  - MySQL → `mysqldump`, `mysql`
+  - MongoDB → `mongodump`, `mongorestore`
 
-Design already discussed and ready to implement when ready:
-- AES-256-GCM encryption, applied to every backup automatically (no opt-out)
-- Key derivation via PBKDF2WithHmacSHA256 (310,000 iterations, OWASP minimum) — raw passphrase never used directly as key
-- Random salt + IV per file, stored in file header (`MAGIC_HEADER + SALT + IV + ciphertext`)
-- Key handling: `--key-file` flag OR interactive passphrase prompt
-- New files planned: `security/EncryptionService.java`, `security/EncryptionResult.java`
-- Zero new dependencies needed — uses JDK's built-in `javax.crypto`
+### Build
 
-### Correctness pass (2026-07-05)
-Made the code match what this README claims. All pending a first clean build in IntelliJ:
-- **AI now actually enables.** `AppConfig` read the env var `KEY` while every message said `ANTHROPIC_API_KEY`; it now reads `ANTHROPIC_API_KEY`.
-- **Compression is real, not cosmetic.** Added the correct dependencies (`org.apache.commons:commons-compress`, `org.lz4:lz4-java:1.8.0`, `com.github.luben:zstd-jni`) so BZIP2/LZ4/ZSTD load instead of silently falling back to GZIP. `CompressionStrategy.isAvailable()` now probes the classpath for the backing library (what's actually used) rather than running `which`/`where` on a CLI binary that is never invoked.
-- **Per-engine default ports.** `--port` now defaults to 5432/3306/27017 based on the resolved DB type instead of a hardcoded 5432 for everything.
-- **HTTP timeouts** added to `RootCauseAnalyser` and `NaturalLanguageParser` (they could previously hang the CLI forever).
-- **Robust JSON escaping.** All three AI callers now share `util/JsonStrings.escape()`, which escapes every control character (not just `\n`/`\"`), so odd bytes in tool stderr can't produce a malformed request body.
-- **MongoDB credentials URL-encoded** in the connection string so a password containing `@ : / ? #` no longer corrupts the URI.
-- **Backups no longer committed to git** — `backups/` and `*_report.txt` are gitignored.
-- **Unit tests** added for the pure functions (`ClaudeResponse`, `JsonStrings`, `CompressionStrategy`).
+```bash
+mvn clean package
+```
 
-### Still Outstanding
-- `Main.java` still sits in `org.example` package — should be moved to `com.backuputil` for consistency (left for an IDE refactor so the run configuration updates with it).
-- Password masking in terminal input — picocli's `interactive=true` echoes the password in plaintext in some terminal contexts (e.g. IntelliJ Run window). A more robust fix using `System.console().readPassword()` was designed but deliberately skipped as a low-priority cosmetic issue.
-- MongoDB still passes `--password` as a process argument (visible in `ps aux`) on both backup and restore — unlike Postgres/MySQL which use env vars. mongodump/mongorestore have no password env var, so this needs a different approach (e.g. `--config` file). The connection string used for the JDBC-style handshake is now URL-encoded, but the argv exposure to the native tools remains.
-- Postgres restore replays a plain SQL script without `--clean`/`--if-exists`, so it targets an empty database cleanly but errors on pre-existing objects.
+…or **Build Project** in IntelliJ.
 
----
+### Configure the AI layer (optional)
 
-## Environment Variables
+Set these as environment variables in your run configuration:
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude API key for real AI analysis/parsing (not yet obtained) |
-| `MOCK_AI` | Set to `true` to use free rule-based mock AI instead of real API calls |
+| `GEMINI_API_KEY` | Google Gemini API key for real AI analysis/parsing. Free tier — get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). |
+| `MOCK_AI` | Set to `true` to use the free offline rule-based mock instead of real API calls. |
+
+If neither is set, AI features are skipped and the core backup/restore still runs.
+
+### Run
+
+Run `org.example.Main` from IntelliJ (set **Program arguments**), or via `java -cp`.
+
+```bash
+# Flag-driven backup
+-t postgres -H localhost -u postgres -d shop_db
+
+# Natural-language backup
+--nl "backup my postgres database called shop_db on localhost with user admin"
+
+# Interactive point-in-time restore (pick a snapshot)
+-t postgres -u postgres -d shop_db --restore
+
+# Restore a specific archive
+-t postgres -u postgres -d shop_db --restore-file ./backups/shop_db_20260709_224318_backup.sql.zst
+
+# Backup and also write the report to a .txt file
+-t postgres -u postgres -d shop_db --report
+```
 
 ---
 
-## Suggested Next Steps (in priority order)
+## Command-line options
 
-1. Learn FastAPI, encryption fundamentals, and authentication basics (in progress)
-2. Implement the Encryption + Security layer using the design above
-3. Move `Main.java` to `com.backuputil` package
-4. Fix compression library Maven coordinates (BZIP2/LZ4/ZSTD)
-5. Add unit tests
-6. Phase 5 — Cloud Upload (S3) once budget allows
-7. Write a proper architecture diagram for the README (for resume/portfolio presentation)
+| Option | Description | Default |
+|---|---|---|
+| `-t`, `--type` | Engine: `postgres` / `mysql` / `mongo` | prompted |
+| `-H`, `--host` | Database host | `localhost` |
+| `-p`, `--port` | Database port | per engine (5432 / 3306 / 27017) |
+| `-u`, `--user` | Username | prompted |
+| `-P`, `--password` | Password (entered interactively) | prompted |
+| `-d`, `--database` | Database name | prompted |
+| `-o`, `--output` | Output directory | `./backups` |
+| `--backup-frequency` | Backups per day (informs compression advice) | `1` |
+| `--nl "<text>"` | Describe the job in natural language | — |
+| `--restore` | Interactive restore — pick a snapshot | off |
+| `--restore-file <path>` | Restore a specific archive file | — |
+| `--report` | Also write the post-backup report to a file | off |
+| `--mock` | Bypass the connection check (for pipeline testing) | off |
 
 ---
 
-## Development Log
+## Compression strategies
 
-### 2026-06-27 — Phase 4 + flaw fixes
+| Strategy | Extension | Best for |
+|---|---|---|
+| **GZIP** | `.gz` | Maximum compatibility; always available (JDK-native) |
+| **ZSTD** | `.zst` | Balanced speed/ratio — the default recommendation |
+| **LZ4** | `.lz4` | Speed — large or frequently-run backups |
+| **BZIP2** | `.bz2` | Maximum ratio — small, infrequent backups |
 
-**Phase 4 (Restore + Report) implemented**
-- `restore()` is now real in all three services — decompress the archive and stream it into `psql` / `mysql` / `mongorestore --archive` via stdin, with the same dual virtual-thread draining the backup path uses. The interface now returns a structured `RestoreResult`.
-- `RestoreAdvisor` — AI-guided interactive restore: point-in-time picker (snapshots parsed from filenames), extension-based decompression auto-detect with a magic-byte safety net, destructive-operation confirmation gate, and AI guidance (rule-based in mock mode, Claude in real mode).
-- `BackupReportGenerator` — human-readable report with a Trends section (count, total size, delta vs previous run) and recommendations, derived by scanning prior backups on disk.
-- `util/CompressionStreams` — centralised, magic-byte-aware decompression for the restore path.
-- New CLI flags: `--restore`, `--restore-file <path>`, `--report`.
+The advisor estimates the database size (`pg_database_size` / `information_schema` /
+`dbStats`) and backup frequency, recommends a strategy with its reasoning, and lets you accept
+or override it. On restore, the format is detected from the archive automatically.
 
-**Correctness fixes**
-- MySQL backup never set `MYSQL_PWD` → real MySQL backups were broken. Fixed.
-- Mongo reported `dbType` as `"mysql"`; MySQL's error path reported `"postgres"`. Both fixed.
-- `mkdirs()` return value is now checked before proceeding.
+---
 
-**Compression heuristic fixed**
-- `estimateDbSize()` was hard-coded to 100 MB and the `> 500` / `< 100` thresholds left a gap, so the advisor *always* returned ZSTD. Each service now implements `estimateSizeBytes()` (`pg_database_size` / `information_schema` sum / Mongo `dbStats.dataSize`), and the tiers use inclusive boundaries so every size lands in exactly one branch (mock / query failure → balanced ZSTD default).
-- The size is captured **during** `testConnection` on the connection it already opens (cached per run), so the advisor reuses it instead of opening a second connection — one DB round-trip instead of two.
+## Testing
 
-**Robust Claude response parsing**
-- The old `indexOf("text") … lastIndexOf("\"")` approach captured trailing JSON (`stop_reason`, `usage`) on real API responses. Replaced with a single escape-aware extractor, `util/ClaudeResponse.extractText()`, now shared by `RootCauseAnalyser`, `NaturalLanguageParser`, and `RestoreAdvisor`.
+```bash
+mvn test
+```
 
-**Changeset:** 5 new files (`RestoreResult`, `RestoreAdvisor`, `BackupReportGenerator`, `ClaudeResponse`, `CompressionStreams`), 10 modified.
+JUnit 5 tests cover the pure helpers — response-text extraction (`LlmResponse`), JSON escaping
+(`JsonStrings`), and compression-strategy detection (`CompressionStrategy`).
 
-> Implemented but not yet compiled/run (no JDK/Maven on PATH at the time) — build + smoke-test in IntelliJ before relying on it.
+---
 
-**Still open after this session:** `KEY` → `ANTHROPIC_API_KEY` env-var mismatch in `AppConfig`; MongoDB password passed in argv + not URL-encoded; no HTTP timeouts on the two older AI callers; `--port` defaults to 5432 for all engines; a backup artifact is committed under `backups/`; no unit tests.
+## Notes & limitations
+
+- **Restore targets an empty database.** PostgreSQL restore replays a plain SQL script, so
+  pre-existing objects with the same names will conflict — restore into a fresh database.
+- **MongoDB credentials.** `mongodump` / `mongorestore` have no password environment variable,
+  so the password is passed as a process argument for those two tools (PostgreSQL and MySQL use
+  env vars). A config-file approach is the planned improvement.
+
+---
+
+## Roadmap
+
+- **Encryption at rest** — AES-256-GCM applied to every archive, key derived from a passphrase
+  via PBKDF2 (random salt + IV per file, stored in a file header). Designed; not yet implemented.
+- **Cloud upload** — push archives to object storage (AWS S3), with AI-assisted storage-tier
+  decisions (e.g. age-based transition to cold storage).
+- **Password input masking** in terminals that echo interactive input.
