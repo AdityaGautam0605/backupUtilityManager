@@ -2,7 +2,7 @@ package com.backuputil.ai;
 
 import com.backuputil.config.AppConfig;
 import com.backuputil.model.ParsedIntent;
-import com.backuputil.util.GeminiClient;
+import com.backuputil.util.OpenAiClient;
 
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -10,11 +10,11 @@ import java.util.regex.Pattern;
 public class NaturalLanguageParser {
 
     private final AppConfig config;
-    private final GeminiClient gemini;
+    private final OpenAiClient openAi;
 
     public NaturalLanguageParser() {
         this.config = AppConfig.getInstance();
-        this.gemini = new GeminiClient();
+        this.openAi = new OpenAiClient();
     }
 
     public ParsedIntent parse (String input){
@@ -77,9 +77,9 @@ public class NaturalLanguageParser {
                 "Sentence: " + input;
 
         // The model returns a JSON object as plain text; extract the fields from it.
-        String jsonText = gemini.generate(systemInstruction);
+        String jsonText = openAi.generate(systemInstruction);
         if (jsonText == null){
-            throw new RuntimeException("Gemini returned no usable response");
+            throw new RuntimeException("OpenAI returned no usable response");
         }
         return parseJsonResponse(jsonText);
     }

@@ -22,6 +22,37 @@ public final class LlmResponse {
     private LlmResponse() {
     }
 
+    /** Extract only completed assistant output from the Responses API, ignoring metadata/tools. */
+    public static String extractOpenAiText(String body) {
+        if (body == null || body.isBlank()) return null;
+        try {
+            // Reuse the BSON library's JSON parser already supplied by the MongoDB driver.
+            org.bson.Document response = org.bson.Document.parse(body);
+            if (!"completed".equals(response.getString("status")) || response.get("error") != null) return null;
+            Object output = response.get("output");
+            if (!(output instanceof java.util.List<?> items)) return null;
+            StringBuilder text = new StringBuilder();
+            for (Object item : items) {
+                if (!(item instanceof org.bson.Document message)
+                        || !"message".equals(message.getString("type"))
+                        || !"assistant".equals(message.getString("role"))) continue;
+                if (!"completed".equals(message.getString("status"))) return null;
+                if (!(message.get("content") instanceof java.util.List<?> content)) continue;
+                for (Object part : content) {
+                    if (!(part instanceof org.bson.Document block)) continue;
+                    if ("refusal".equals(block.getString("type"))) return null;
+                    if ("output_text".equals(block.getString("type")) && block.get("text") instanceof String value) {
+                        if (!text.isEmpty()) text.append('\n');
+                        text.append(value);
+                    }
+                }
+            }
+            return text.toString().isBlank() ? null : text.toString();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     /**
      * Extracts the first {@code "text"} value, or {@code null} if none is present.
      */

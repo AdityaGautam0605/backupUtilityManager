@@ -5,7 +5,7 @@ import com.backuputil.config.DbConfig;
 import com.backuputil.model.CompressionStrategy;
 import com.backuputil.model.RestoreResult;
 import com.backuputil.service.DatabaseService;
-import com.backuputil.util.GeminiClient;
+import com.backuputil.util.OpenAiClient;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
  *    filenames) and lets the user pick which snapshot to restore.
  *  - Decompression strategy auto-detection from the file extension.
  *  - A destructive-operation confirmation gate (restore overwrites live data).
- *  - AI guidance: a short safety briefing (rule-based in mock mode, Gemini in real mode).
+ *  - AI guidance: a short safety briefing (rule-based in mock mode, OpenAI in real mode).
  *
  * The advisor does not pick the service implementation — {@code BackupCommand} already
  * resolves the DB type and hands the matching {@link DatabaseService} in.
@@ -40,12 +40,12 @@ public class RestoreAdvisor {
 
     private final AppConfig config;
     private final BufferedReader inputReader;
-    private final GeminiClient gemini;
+    private final OpenAiClient openAi;
 
     public RestoreAdvisor() {
         this.config = AppConfig.getInstance();
         this.inputReader = new BufferedReader(new InputStreamReader(System.in));
-        this.gemini = new GeminiClient();
+        this.openAi = new OpenAiClient();
     }
 
     /**
@@ -58,7 +58,7 @@ public class RestoreAdvisor {
         String chosenFile = explicitFile;
 
         if (chosenFile == null || chosenFile.isBlank()) {
-            List<Path> candidates = listBackups(outputDir, dbConfig.getDbName());
+            List<Path> candidates = listBackups(outputDir, dbConfig.getDbName(), dbType);
             if (candidates.isEmpty()) {
                 System.out.println("[Restore Advisor] No backups found for '" + dbConfig.getDbName()
                         + "' in " + new File(outputDir).getAbsolutePath());
@@ -88,7 +88,7 @@ public class RestoreAdvisor {
 
     // ---- point-in-time selection -------------------------------------------------
 
-    private List<Path> listBackups(String outputDir, String dbName) {
+    static List<Path> listBackups(String outputDir, String dbName, String dbType) {
         List<Path> result = new ArrayList<>();
         File dir = new File(outputDir);
         File[] files = dir.listFiles();
@@ -97,7 +97,10 @@ public class RestoreAdvisor {
         for (File f : files) {
             if (!f.isFile()) continue;
             Matcher m = BACKUP_FILE.matcher(f.getName());
-            if (m.matches() && m.group(1).equalsIgnoreCase(dbName)) {
+            String suffix = "mongo".equalsIgnoreCase(dbType) ? ".bson" : ".sql";
+            boolean supported = java.util.Arrays.stream(CompressionStrategy.values())
+                    .anyMatch(strategy -> f.getName().endsWith(suffix + strategy.getExtension()));
+            if (m.matches() && m.group(1).equals(dbName) && supported) {
                 result.add(f.toPath());
             }
         }
@@ -162,8 +165,12 @@ public class RestoreAdvisor {
                 + " - Target      : " + dbConfig.getDbName() + " (" + dbType + ") on "
                 + dbConfig.getHost() + ":" + dbConfig.getPort() + "\n"
                 + " - Decompress  : " + strategy.name() + " (auto-detected)\n"
-                + " - Risk        : existing objects with the same names may be overwritten.\n"
-                + " - Recommended : ensure the target database exists and take a fresh safety backup first.";
+                + " - Risk        : existing objects may conflict; MySQL/MongoDB failures can leave partial changes.\n"
+                + " - Recommended : use an empty target database and take a fresh safety backup first.\n"
+                + " - Validation  : archive is checked, then streamed without temporary files; keep it unchanged.\n"
+                + ("mongo".equalsIgnoreCase(dbType)
+                    ? " - Scope       : only namespaces in '" + dbConfig.getDbName() + "' are restored; no database renaming."
+                    : " - Source      : use a trusted SQL dump from the selected engine.");
     }
 
     private String aiGuidance(DbConfig dbConfig, String dbType, String file, CompressionStrategy strategy) {
@@ -174,7 +181,7 @@ public class RestoreAdvisor {
                 dbType, dbConfig.getDbName(), new File(file).getName(), strategy.name());
 
         // Returns null on any failure, so guidance() falls back to the rule-based briefing.
-        return gemini.generate(prompt);
+        return openAi.generate(prompt);
     }
 
     // ---- helpers -----------------------------------------------------------------

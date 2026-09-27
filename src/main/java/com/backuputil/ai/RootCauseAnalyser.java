@@ -2,29 +2,29 @@ package com.backuputil.ai;
 
 import com.backuputil.config.AppConfig;
 import com.backuputil.model.BackupResult;
-import com.backuputil.util.GeminiClient;
+import com.backuputil.util.OpenAiClient;
 
 public class RootCauseAnalyser {
 
     private final AppConfig config;
-    private final GeminiClient gemini;
+    private final OpenAiClient openAi;
 
     public RootCauseAnalyser(){
         this.config = AppConfig.getInstance();
-        this.gemini = new GeminiClient();
+        this.openAi = new OpenAiClient();
     }
 
     public String analyse(BackupResult result){
         if(!config.isAiEnabled()){
-            return "[AI disabled — set GEMINI_API_KEY to enable analysis]";
+            return "[AI disabled — set OPENAI_API_KEY to enable analysis]";
         }
         if(config.isMockAi()){
             return generateMockAnalysis(result);
         }
 
-        String analysis = gemini.generate(buildPrompt(result));
+        String analysis = openAi.generate(buildPrompt(result));
         return analysis != null ? analysis.trim()
-                : "[AI] Analysis unavailable — the Gemini request failed";
+                : "[AI] Analysis unavailable — the OpenAI request failed";
     }
 
     private String generateMockAnalysis (BackupResult result){
@@ -50,7 +50,7 @@ public class RootCauseAnalyser {
         }
     }
 
-    // Plain-text prompt (real newlines) — GeminiClient JSON-escapes it before sending.
+    // Plain-text prompt (real newlines) — OpenAiClient JSON-escapes it before sending.
     private String buildPrompt (BackupResult result){
         if(result.getStatus() == BackupResult.Status.SUCCESS){
             return String.format(

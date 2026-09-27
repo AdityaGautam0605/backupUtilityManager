@@ -17,7 +17,7 @@ clean structured reporting.
 - **Streaming compression** — data is piped straight from the dump process through the
   compressor to disk, so even a large database is handled in **constant memory**. Pick GZIP,
   ZSTD, LZ4, or BZIP2.
-- **AI assistance (Google Gemini, free tier)** with a built-in offline **mock mode** — no
+- **AI assistance (OpenAI Responses API)** with a built-in offline **mock mode** — no
   API key or network needed to try it:
   - **Root-cause analysis** of every run, success or failure.
   - **Compression advisor** that reads the real database size and recommends a strategy.
@@ -46,6 +46,7 @@ com.backuputil/
 │   └── ParsedIntent.java         — output of natural-language parsing
 ├── service/
 │   ├── DatabaseService.java      — engine interface
+│   ├── NativeRestore.java        — archive validation and shared native restore lifecycle
 │   └── impl/
 │       ├── PostgresService.java
 │       ├── MysqlService.java
@@ -57,8 +58,8 @@ com.backuputil/
 │   ├── RestoreAdvisor.java       — interactive point-in-time restore + guidance
 │   └── BackupReportGenerator.java— human-readable report with trends
 └── util/
-    ├── GeminiClient.java         — single Gemini API client, shared by the ai/ classes
-    ├── LlmResponse.java          — dependency-free response-text extractor
+    ├── OpenAiClient.java         — OpenAI Responses API client, shared by the ai/ classes
+    ├── LlmResponse.java          — response-text extraction (OpenAI plus legacy helpers)
     ├── JsonStrings.java          — RFC-8259 JSON string escaping
     └── CompressionStreams.java   — magic-byte-aware decompression for restore
 
@@ -82,8 +83,12 @@ org.example/
 - **Real, pluggable compression.** GZIP (JDK-native) plus ZSTD, LZ4, and BZIP2 via libraries,
   chosen by an advisor that queries the actual database size and backup frequency.
 - **Safe restores.** The decompressor is selected from the file extension and confirmed by the
-  archive's magic bytes; a destructive-operation gate requires explicit confirmation before any
-  write to a live database.
+  GZIP magic-byte fallback. A validation pass decompresses and discards the output before a
+  database client starts, rejecting empty payloads and detected compression corruption. A second
+  pass streams decompressed bytes directly into the client without staging files. A
+  destructive-operation gate requires explicit confirmation before any write to a live database.
+  PostgreSQL restores stop on SQL errors and run in one transaction; MongoDB restores filter to
+  the selected database's namespaces and stop on errors.
 - **Honest failure semantics.** Every run returns a structured result (status, size, duration,
   exit code, error message); a failed backup deletes its own incomplete archive instead of
   leaving a corrupt file behind.
@@ -115,10 +120,19 @@ Set these as environment variables in your run configuration:
 
 | Variable | Purpose |
 |---|---|
-| `GEMINI_API_KEY` | Google Gemini API key for real AI analysis/parsing. Free tier — get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). |
+| `OPENAI_API_KEY` | Your OpenAI API key for real AI analysis/parsing; set it in your terminal or IntelliJ run environment. |
+| `OPENAI_MODEL` | Optional Responses API model override; defaults to `gpt-4.1-mini`. |
 | `MOCK_AI` | Set to `true` to use the free offline rule-based mock instead of real API calls. |
 
-If neither is set, AI features are skipped and the core backup/restore still runs.
+Without an API key or mock mode, AI features are disabled and core backup/restore still runs.
+`OPENAI_MODEL` alone does not enable AI. The old `GEMINI_API_KEY` setting is no longer used.
+Set `MOCK_AI=false` when you want real requests. Do not put API keys in source files or commits.
+In IntelliJ, add `OPENAI_API_KEY` under **Run → Edit Configurations → Environment variables**.
+Restart the application after changing environment settings.
+
+The client uses [OpenAI's Responses API](https://developers.openai.com/api/docs/guides/text),
+Bearer authentication, and `store: false`. Completed assistant text is extracted from the
+response's `output` array; failed, incomplete, or refused responses use the existing fallback paths.
 
 ### Run
 
@@ -184,8 +198,19 @@ or override it. On restore, the format is detected from the archive automaticall
 mvn test
 ```
 
-JUnit 5 tests cover the pure helpers — response-text extraction (`LlmResponse`), JSON escaping
-(`JsonStrings`), and compression-strategy detection (`CompressionStrategy`).
+JUnit 5 tests cover response-text extraction, JSON escaping, compression detection, restore
+selection, all four decompression formats, corrupt/empty archives, native error propagation,
+target restrictions, cancellation, source changes, and streaming without temporary storage.
+A subprocess test restores a 64 MiB payload with a 32 MiB heap and a nonexistent temporary
+directory. Unit tests use controlled child
+process substitutes and do not connect to existing databases.
+
+For real PostgreSQL recovery tests, set `RESTORE_TEST_PG_BIN` to a directory containing `initdb`,
+`pg_ctl`, `pg_dump`, and `psql`, and add that directory to `PATH`, then run `mvn clean test`.
+The tests initialize a separate local cluster on an available loopback port, check a dump/restore
+round trip and rollback on SQL errors, and stop the cluster afterwards. Test data and logs remain
+under `target/restore-pg-test-*`. Without that environment variable, these integration tests are
+skipped. They do not use the credentials or databases configured for normal CLI runs.
 
 ---
 
@@ -193,6 +218,29 @@ JUnit 5 tests cover the pure helpers — response-text extraction (`LlmResponse`
 
 - **Restore targets an empty database.** PostgreSQL restore replays a plain SQL script, so
   pre-existing objects with the same names will conflict — restore into a fresh database.
+- **Restore storage and cost.** Restore writes no temporary archive or decompressed file. It reads
+  and decompresses the source twice: once for validation, then again while streaming to the client.
+  Buffers and SHA-256 digests keep memory bounded independently of archive size. Database files,
+  transaction logs, and the database client's own storage requirements still apply.
+- **Keep the archive unchanged during restore.** Both passes share one open file handle and a
+  shared file lock. Size/timestamp checks and a SHA-256 comparison detect changes; the client is
+  stopped on a detected change or stream failure before stdin is closed. Filesystem locks may be
+  advisory, so this is not an immutable snapshot: concurrent writes or second-pass I/O failures
+  can still leave partial changes in MySQL/MongoDB. Restore requires a seekable file with shared
+  locking support; stdin/FIFO sources are not supported.
+- **Rollback limits.** PostgreSQL uses `psql -X --set=ON_ERROR_STOP=on --single-transaction --file=-`
+  for the plain dumps produced by this tool. Arbitrary scripts containing their own transaction
+  control, connection changes, or commands forbidden in a transaction are not supported.
+  MySQL and MongoDB can leave partial changes after a native restore failure; they are not atomic.
+- **MongoDB scope.** Restore filters to `<selected-database>.*`; it does not rename databases or
+  drop existing collections. Generated archives naming a different source database are rejected.
+  Use the original database name, including its case. For externally named archives, ensure that
+  database's namespaces actually exist in the archive; namespace filtering does not remap them.
+  MongoDB restore currently accepts database names containing letters, digits, `_`, and `-`.
+- **Archive provenance.** The picker separates SQL and MongoDB archives, but legacy SQL filenames
+  cannot distinguish PostgreSQL from MySQL or identify a source host. Use a separate backup
+  directory per source and restore only trusted dumps from the selected engine. Compression
+  validation does not prove SQL/BSON correctness or completeness; the native client checks content.
 - **MongoDB credentials.** `mongodump` / `mongorestore` have no password environment variable,
   so the password is passed as a process argument for those two tools (PostgreSQL and MySQL use
   env vars). A config-file approach is the planned improvement.
