@@ -2,17 +2,17 @@ package com.backuputil.ai;
 
 import com.backuputil.model.BackupResult;
 
-import java.io.File;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Comparator;
+
 import java.util.Date;
 import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+
+
 
 /**
  * Phase 4 — human-readable post-backup report with trends and recommendations.
@@ -24,8 +24,6 @@ import java.util.regex.Pattern;
  */
 public class BackupReportGenerator {
 
-    private static final Pattern BACKUP_FILE =
-            Pattern.compile("^(.*)_(\\d{8})_(\\d{6})_backup\\..*$");
 
     /** Builds the full report text for a finished backup run. */
     public String generate(BackupResult result, String outputDir) {
@@ -63,11 +61,11 @@ public class BackupReportGenerator {
         StringBuilder sb = new StringBuilder();
         sb.append("------------------- TRENDS ---------------------\n");
 
-        List<Path> history = listBackups(outputDir, result.getDbName());
+        List<Path> history = RestoreAdvisor.listBackups(outputDir, result.getDbName(), result.getDbType());
 
         if (history.isEmpty()) {
             sb.append(pad("History")).append("no archives on disk yet\n");
-            sb.append(recommendations(result, history, -1)).append('\n');
+            sb.append(recommendations(result, history, Double.NaN)).append('\n');
             return sb.toString();
         }
 
@@ -77,18 +75,32 @@ public class BackupReportGenerator {
         sb.append(pad("Backups on disk")).append(history.size())
                 .append(" (total ").append(humanSize(totalSize)).append(")\n");
 
-        // history is newest-first; index 0 is the run we just made.
-        double deltaPct = -1;
-        if (history.size() >= 2) {
-            long current = safeSize(history.get(0));
-            long previous = safeSize(history.get(1));
-            if (previous > 0) {
-                deltaPct = ((double) (current - previous) / previous) * 100.0;
-                sb.append(pad("Previous archive")).append(humanSize(previous))
+        double deltaPct = Double.NaN;
+        if (result.getStatus() != BackupResult.Status.SUCCESS) {
+            sb.append(pad("Size comparison")).append("unavailable — this run did not produce a successful backup\n");
+        } else if (result.getOutputPath() == null || !Files.isRegularFile(Path.of(result.getOutputPath()))) {
+            sb.append(pad("Size comparison")).append("unavailable — current archive is missing\n");
+        } else {
+            Path current = Path.of(result.getOutputPath()).toAbsolutePath().normalize();
+            String name = current.getFileName().toString();
+            String extension = name.substring(name.lastIndexOf('.') + 1);
+            // Select a genuinely older file, rather than assuming the newest is this run.
+            Path previous = history.stream()
+                    .filter(p -> !p.toAbsolutePath().normalize().equals(current))
+                    .filter(p -> p.getFileName().toString().compareTo(name) < 0)
+                    .filter(p -> p.getFileName().toString().endsWith("." + extension))
+                    .findFirst().orElse(null);
+            if (previous == null) {
+                sb.append(pad("Previous archive")).append("no older archive with the same format/compression\n");
+            } else if (safeSize(previous) <= 0) {
+                sb.append(pad("Size comparison")).append("unavailable — previous archive is empty or unreadable\n");
+            } else {
+                long previousSize = safeSize(previous);
+                deltaPct = ((double) (result.getFileSizeBytes() - previousSize) / previousSize) * 100.0;
+                sb.append(pad("Previous archive")).append(previous.getFileName()).append(" ( ")
+                        .append(humanSize(previousSize)).append(")")
                         .append(String.format("  (%+.1f%% vs previous)", deltaPct)).append('\n');
             }
-        } else {
-            sb.append(pad("Previous archive")).append("none — this is the first backup\n");
         }
 
         sb.append(recommendations(result, history, deltaPct)).append('\n');
@@ -99,15 +111,15 @@ public class BackupReportGenerator {
         List<String> notes = new ArrayList<>();
 
         if (result.getStatus() != BackupResult.Status.SUCCESS) {
-            notes.add("Backup did not succeed — review the error above and the AI analysis before relying on this archive.");
+            notes.add("Backup did not succeed — no usable backup was produced by this run. Review the error above.");
         } else if (result.getFileSizeBytes() == 0) {
             notes.add("Archive is 0 bytes — the dump may have produced no data; verify the source database is populated.");
         }
 
         if (deltaPct >= 25) {
-            notes.add(String.format("Archive grew %.0f%% since the last run — investigate unexpected data growth.", deltaPct));
+            notes.add(String.format("Compressed archive grew %.0f%% versus the previous comparable archive; confirm this matches expected changes.", deltaPct));
         } else if (deltaPct <= -25) {
-            notes.add(String.format("Archive shrank %.0f%% since the last run — confirm no data was lost.", Math.abs(deltaPct)));
+            notes.add(String.format("Compressed archive shrank %.0f%% versus the previous comparable archive; confirm this matches expected changes.", Math.abs(deltaPct)));
         }
 
         if (history.size() > 10) {
@@ -115,7 +127,7 @@ public class BackupReportGenerator {
         }
 
         if (notes.isEmpty()) {
-            notes.add("Backup looks healthy — size and outcome are within normal range.");
+            notes.add("Dump command succeeded. Archive size alone does not verify data completeness; test restoration.");
         }
 
         StringBuilder sb = new StringBuilder();
@@ -127,28 +139,14 @@ public class BackupReportGenerator {
         return sb.toString();
     }
 
-    private List<Path> listBackups(String outputDir, String dbName) {
-        List<Path> result = new ArrayList<>();
-        File dir = new File(outputDir);
-        File[] files = dir.listFiles();
-        if (files == null) return result;
-
-        for (File f : files) {
-            if (!f.isFile()) continue;
-            Matcher m = BACKUP_FILE.matcher(f.getName());
-            if (m.matches() && m.group(1).equalsIgnoreCase(dbName)) {
-                result.add(f.toPath());
-            }
-        }
-        result.sort(Comparator.comparing((Path p) -> p.getFileName().toString()).reversed());
-        return result;
-    }
-
     // ---- formatting helpers ------------------------------------------------------
 
     private String throughput(BackupResult result) {
-        if (result.getDurationMs() <= 0 || result.getFileSizeBytes() <= 0) return "n/a";
-        double mbPerSec = (result.getFileSizeBytes() / (1024.0 * 1024)) / (result.getDurationMs() / 1000.0);
+        if (result.getStatus() != BackupResult.Status.SUCCESS || result.getDurationMs() <= 0 || result.getFileSizeBytes() <= 0) return "n/a";
+        double bytesPerSec = result.getFileSizeBytes() / (result.getDurationMs() / 1000.0);
+        if (bytesPerSec < 1024) return String.format("%.1f B/s (compressed)", bytesPerSec);
+        if (bytesPerSec < 1024 * 1024) return String.format("%.2f KB/s (compressed)", bytesPerSec / 1024);
+        double mbPerSec = bytesPerSec / (1024 * 1024);
         return String.format("%.2f MB/s (compressed)", mbPerSec);
     }
 

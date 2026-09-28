@@ -95,4 +95,19 @@
             </plugin>
         </plugins>
     </build>
+    <profiles>
+        <profile>
+            <id>benchmark</id>
+            <build><plugins><plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.6.1</version>
+                <executions><execution>
+                    <id>benchmark-classpath</id><phase>test-compile</phase>
+                    <goals><goal>build-classpath</goal></goals>
+                    <configuration><outputFile>${project.build.directory}/benchmark-classpath.txt</outputFile></configuration>
+                </execution></executions>
+            </plugin></plugins></build>
+        </profile>
+    </profiles>
 </project>

@@ -4,8 +4,8 @@ import com.backuputil.config.*;
 import com.backuputil.model.CompressionStrategy;
 import com.backuputil.service.DatabaseService;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+
+
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -13,12 +13,12 @@ public class CompressionAdvisor {
 
     private final AppConfig config;
 
-    // single shared reader - never create Scanner (System.in) inside a method;
-    private final BufferedReader inputReader;
+
+
 
     public CompressionAdvisor (){
         this.config = AppConfig.getInstance();
-        this.inputReader = new BufferedReader(new InputStreamReader(System.in));
+
     }
 
     // Step 1 — detect DB size automatically, don't ask the user
@@ -64,7 +64,7 @@ public class CompressionAdvisor {
                 + "] or type another strategy (GZIP/BZIP2/LZ4/ZSTD): ");
 
         try {
-            String userInput = inputReader.readLine();
+            String userInput = com.backuputil.util.ConsoleInput.readLine("");
 
             if (userInput == null || userInput.isBlank()) {
                 System.out.println("[AI Compression Advisor] Accepted: " + recommended.name());

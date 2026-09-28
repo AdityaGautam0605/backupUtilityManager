@@ -7,9 +7,9 @@ import com.backuputil.model.RestoreResult;
 import com.backuputil.service.DatabaseService;
 import com.backuputil.util.OpenAiClient;
 
-import java.io.BufferedReader;
+
 import java.io.File;
-import java.io.InputStreamReader;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -39,12 +39,12 @@ public class RestoreAdvisor {
             Pattern.compile("^(.*)_(\\d{8})_(\\d{6})_backup\\..*$");
 
     private final AppConfig config;
-    private final BufferedReader inputReader;
+
     private final OpenAiClient openAi;
 
     public RestoreAdvisor() {
         this.config = AppConfig.getInstance();
-        this.inputReader = new BufferedReader(new InputStreamReader(System.in));
+
         this.openAi = new OpenAiClient();
     }
 
@@ -122,7 +122,7 @@ public class RestoreAdvisor {
         System.out.print("\nEnter the number to restore (or blank to cancel): ");
 
         try {
-            String line = inputReader.readLine();
+            String line = com.backuputil.util.ConsoleInput.readLine("");
             if (line == null || line.isBlank()) return null;
             int idx = Integer.parseInt(line.trim());
             if (idx < 1 || idx > candidates.size()) {
@@ -143,7 +143,7 @@ public class RestoreAdvisor {
         System.out.print("\n[WARNING] This will replay the archive into the live database '" + dbName
                 + "' and may overwrite existing data.\nType 'yes' to proceed: ");
         try {
-            String line = inputReader.readLine();
+            String line = com.backuputil.util.ConsoleInput.readLine("");
             return line != null && line.trim().equalsIgnoreCase("yes");
         } catch (Exception e) {
             return false;

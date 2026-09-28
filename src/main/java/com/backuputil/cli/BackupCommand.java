@@ -28,7 +28,7 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"-o", "--output"}, description = "Directory folder path to store backups", defaultValue = "./backups")
     private String outputDir;
 
-    @Option(names = {"-t", "--type"}, description = "DBMS type (postgres, mysql)")
+    @Option(names = {"-t", "--type"}, description = "DBMS type (postgres, mysql, mongo)")
     private String dbType;
 
     @Option(names = {"-H", "--host"}, description = "Database host address", defaultValue = "localhost")
@@ -42,13 +42,13 @@ public class BackupCommand implements Callable<Integer> {
     @Option(names = {"-u", "--user"}, description = "Database username")
     private String user;
 
-    @Option(names = {"-P", "--password"}, description = "Database password", interactive = true, prompt = "Enter database password: ")
-    private String password;
+    @Option(names = {"-P", "--password"}, description = "Prompt for the database password (also prompted when omitted)")
+    private boolean passwordPrompt;
 
     @Option(names = {"-d", "--database"}, description = "Target database name")
     private String dbName;
 
-    @Option(names = {"--mock"}, description = "Mock Variable for testing", defaultValue = "false")
+    @Option(names = {"--mock"}, description = "Bypass failed connection checks; native backup/restore still runs against the real database", defaultValue = "false")
     private boolean mock;
 
     @Option(names = {"--backup-frequency"}, description = "How many times per day you run backups", defaultValue = "1")
@@ -91,13 +91,18 @@ public class BackupCommand implements Callable<Integer> {
         RootCauseAnalyser analyser = new RootCauseAnalyser();
         System.out.println ("Initializing workflow verification...");
 
-        DbConfig config = new DbConfig (host, port, user, password, dbName, mock);
-
         DatabaseService dbService = createService(dbType);
         if (dbService == null){
             System.out.println ("Error: Unsupported Database management system engine: "+ dbType);
             return 1;
         }
+
+        String password = com.backuputil.util.ConsoleInput.readPassword();
+        if (password == null) {
+            System.err.println("No password input received; workflow cancelled before connecting.");
+            return 1;
+        }
+        DbConfig config = new DbConfig(host, port, user, password, dbName, mock);
 
         boolean isConnected = dbService.testConnection(config);
         if (!isConnected){
@@ -114,7 +119,7 @@ public class BackupCommand implements Callable<Integer> {
         return runBackup(dbService, config, analyser);
     }
 
-    private DatabaseService createService(String type){
+    DatabaseService createService(String type){
         if ("postgres".equalsIgnoreCase(type)) return new PostgresService();
         if ("mysql".equalsIgnoreCase(type))    return new MysqlService();
         if ("mongo".equalsIgnoreCase(type))     return new MongoService();
@@ -203,15 +208,12 @@ public class BackupCommand implements Callable<Integer> {
         if (intent.getDbName() != null) { dbName = intent.getDbName(); System.out.println("[NL Parser] Detected database: " + dbName); }
         if (intent.isMock())            { mock = true;                 System.out.println("[NL Parser] Mock mode detected"); }
 
-        System.out.println("[NL Parser] Note: passwords are never parsed from natural language — you'll be prompted separately.\n");
+        System.out.println("[NL Parser] Passwords are not extracted from natural-language input.\n");
     }
 
-    private String promptForValue(String promptText) {
-        java.io.Console console = System.console();
-        if (console != null) {
-            return console.readLine(promptText);
-        }
-        System.out.print(promptText);
-        return new java.util.Scanner(System.in).nextLine();
+    private String promptForValue(String promptText) throws java.io.IOException {
+        String value = com.backuputil.util.ConsoleInput.readLine(promptText);
+        if (value == null || value.isBlank()) throw new java.io.IOException("Required input missing; workflow cancelled.");
+        return value.trim();
     }
 }
